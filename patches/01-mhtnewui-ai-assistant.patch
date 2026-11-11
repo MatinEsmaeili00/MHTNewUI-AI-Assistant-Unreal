@@ -1,0 +1,4239 @@
+diff --git a/MetaHumanTest.uproject b/MetaHumanTest.uproject
+index 1cd8ee7..57167d2 100644
+--- a/MetaHumanTest.uproject
++++ b/MetaHumanTest.uproject
+@@ -184,6 +184,10 @@
+ 		{
+ 			"Name": "HoloAvatar",
+ 			"Enabled": true
++		},
++		{
++			"Name": "AudioCapture",
++			"Enabled": true
+ 		}
+ 	]
+ }
+diff --git a/Plugins/MetaHumanAnatomyLayers/Source/MetaHumanAnatomyLayers/Private/AnatomyPickerComp.cpp b/Plugins/MetaHumanAnatomyLayers/Source/MetaHumanAnatomyLayers/Private/AnatomyPickerComp.cpp
+index e717929..ec0ee3a 100644
+--- a/Plugins/MetaHumanAnatomyLayers/Source/MetaHumanAnatomyLayers/Private/AnatomyPickerComp.cpp
++++ b/Plugins/MetaHumanAnatomyLayers/Source/MetaHumanAnatomyLayers/Private/AnatomyPickerComp.cpp
+@@ -167,6 +167,13 @@ void UAnatomyPickerComp::UpdateHover(FVector RayOrigin, FVector RayDirection)
+ 		}
+ 	}
+ 	SetHovered(BestId);
++
++	// A selection made while this layer was still fading in (SelectById during a layer change) could not show its
++	// glow then: show it now that the layer is the one being looked at.
++	if (SelectedId > 0 && HighlightMesh && !HighlightMesh->IsVisible())
++	{
++		RefreshHighlight();
++	}
+ }
+ 
+ void UAnatomyPickerComp::ClearHover()
+@@ -201,6 +208,74 @@ bool UAnatomyPickerComp::SelectHovered()
+ 	return true;
+ }
+ 
++bool UAnatomyPickerComp::SelectById(int32 MuscleId)
++{
++	if (MuscleId <= 0 || !LoadedAtlas || !LoadedAtlas->FindById(MuscleId))
++	{
++		return false;
++	}
++	if (SelectedId != MuscleId)
++	{
++		SelectedId = MuscleId;
++		RefreshHighlight();
++		OnSelectionChanged.Broadcast(SelectedId);
++	}
++	return true;
++}
++
++bool UAnatomyPickerComp::GetMuscleWorldLocation(int32 MuscleId, FVector& OutCentre, float& OutRadius) const
++{
++	OutCentre = FVector::ZeroVector;
++	OutRadius = 0.f;
++	if (!Mesh || !LoadedAtlas)
++	{
++		return false;
++	}
++	const int32 MuscleIndex = LoadedAtlas->Muscles.IndexOfByPredicate([MuscleId](const FMuscleInfo& Info) { return Info.Id == MuscleId; });
++	if (MuscleIndex == INDEX_NONE || !SampleBones.IsValidIndex(MuscleIndex))
++	{
++		return false;
++	}
++
++	// The same points the mouse picking uses, placed on the animated skeleton.
++	const FMuscleInfo& Muscle = LoadedAtlas->Muscles[MuscleIndex];
++	const TArray<int32>& Bones = SampleBones[MuscleIndex];
++	TArray<FVector, TInlineAllocator<64>> Points;
++	TMap<int32, FTransform> BoneCache;
++	for (int32 SampleIndex = 0; SampleIndex < Muscle.Samples.Num() && SampleIndex < Bones.Num(); ++SampleIndex)
++	{
++		const int32 BoneIndex = Bones[SampleIndex];
++		if (BoneIndex == INDEX_NONE)
++		{
++			continue;
++		}
++		const FTransform* Bone = BoneCache.Find(BoneIndex);
++		if (!Bone)
++		{
++			Bone = &BoneCache.Add(BoneIndex, Mesh->GetBoneTransform(BoneIndex));
++		}
++		Points.Add(Bone->TransformPosition(Muscle.Samples[SampleIndex].Offset));
++	}
++	if (Points.Num() == 0)
++	{
++		return false;
++	}
++
++	FVector Sum = FVector::ZeroVector;
++	for (const FVector& Point : Points)
++	{
++		Sum += Point;
++	}
++	OutCentre = Sum / Points.Num();
++	float MaxDistance2 = 0.f;
++	for (const FVector& Point : Points)
++	{
++		MaxDistance2 = FMath::Max<float>(MaxDistance2, FVector::DistSquared(Point, OutCentre));
++	}
++	OutRadius = FMath::Sqrt(MaxDistance2);
++	return true;
++}
++
+ void UAnatomyPickerComp::ClearSelection()
+ {
+ 	if (SelectedId != 0)
+diff --git a/Plugins/MetaHumanAnatomyLayers/Source/MetaHumanAnatomyLayers/Public/AnatomyPickerComp.h b/Plugins/MetaHumanAnatomyLayers/Source/MetaHumanAnatomyLayers/Public/AnatomyPickerComp.h
+index bf6e0be..5df2d2d 100644
+--- a/Plugins/MetaHumanAnatomyLayers/Source/MetaHumanAnatomyLayers/Public/AnatomyPickerComp.h
++++ b/Plugins/MetaHumanAnatomyLayers/Source/MetaHumanAnatomyLayers/Public/AnatomyPickerComp.h
+@@ -70,6 +70,21 @@ public:
+ 	UFUNCTION(BlueprintCallable, Category="Anatomy Picker")
+ 	void ClearSelection();
+ 
++	/** Select a muscle by its atlas ID without the mouse (the assistant's "show me the biceps"). Works while another
++	 *  layer is shown too: the glow appears as soon as this picker's layer is the one you're looking at.
++	 *  Returns false if the atlas has no such ID. Fires OnSelectionChanged if the selection changed. */
++	UFUNCTION(BlueprintCallable, Category="Anatomy Picker")
++	bool SelectById(int32 MuscleId);
++
++	/** The loaded atlas (names, info text), or null before BeginPlay / when it is missing. */
++	UFUNCTION(BlueprintPure, Category="Anatomy Picker")
++	const UMuscleAtlas* GetAtlas() const { return LoadedAtlas; }
++
++	/** Where a muscle is right now, in world space: the middle of its sample points on the animated skeleton, and
++	 *  how far the points reach from it (cm). False if the muscle is unknown or has no usable samples. */
++	UFUNCTION(BlueprintPure, Category="Anatomy Picker")
++	bool GetMuscleWorldLocation(int32 MuscleId, FVector& OutCentre, float& OutRadius) const;
++
+ 	UFUNCTION(BlueprintPure, Category="Anatomy Picker")
+ 	bool IsPickingActive() const;
+ 
+diff --git a/Source/MetaHumanTest/CPP_MouseFunctionComp.cpp b/Source/MetaHumanTest/CPP_MouseFunctionComp.cpp
+index 0d87edd..bc8b97a 100644
+--- a/Source/MetaHumanTest/CPP_MouseFunctionComp.cpp
++++ b/Source/MetaHumanTest/CPP_MouseFunctionComp.cpp
+@@ -2,6 +2,8 @@
+ 
+ #include "GameFramework/Actor.h"
+ #include "GameFramework/SpringArmComponent.h"
++#include "Engine/World.h"
++#include "TimerManager.h"
+ 
+ UCPP_MouseFunctionComp::UCPP_MouseFunctionComp()
+ {
+@@ -32,6 +34,7 @@ void UCPP_MouseFunctionComp::OrbitByDegrees(float YawDegrees, float PitchDegrees
+ 	}
+ 
+ 	RememberStartViewIfNeeded();
++	CancelViewMove();   // the user takes over from a scripted move
+ 
+ 	CurrentArmRot.Yaw += YawDegrees;
+ 	CurrentArmRot.Pitch = FMath::Clamp(CurrentArmRot.Pitch + PitchDegrees, MinPitch, MaxPitch);
+@@ -58,6 +61,7 @@ void UCPP_MouseFunctionComp::SetCameraDistance(float NewDistance)
+ 	}
+ 
+ 	RememberStartViewIfNeeded();
++	CancelViewMove();   // the user takes over from a scripted move
+ 
+ 	CurrentCameraDistance = FMath::Clamp(NewDistance, MinZoom, MaxZoom);
+ 	SpringArmComponent->TargetArmLength = CurrentCameraDistance;
+@@ -71,6 +75,7 @@ void UCPP_MouseFunctionComp::PanFromMouse(const FVector2D& MouseDelta)
+ 	}
+ 
+ 	RememberStartViewIfNeeded();
++	CancelViewMove();   // the user takes over from a scripted move
+ 
+ 	// Use the camera rotation so the pan feels screen-space
+ 	const FRotator CamRot = SpringArmComponent->GetComponentRotation();
+@@ -127,9 +132,156 @@ void UCPP_MouseFunctionComp::ResetView()
+ 	{
+ 		return;
+ 	}
++	CancelViewMove();
+ 	UE_LOG(LogTemp, Log, TEXT("%s: camera reset to its start view (ResetView)"), *GetNameSafe(GetOwner()));
+ 	SpringArmComponent->SetRelativeRotation(StartArmRotation);
+ 	SpringArmComponent->SetRelativeLocation(StartArmLocation);
+ 	SpringArmComponent->TargetArmLength = StartArmLength;
+ 	SyncFromCurrentSpringArm();   // so the next orbit / zoom continues from the reset view
+ }
++
++// ---------------------------------------------------------------------------
++// Scripted camera moves
++// ---------------------------------------------------------------------------
++
++void UCPP_MouseFunctionComp::MoveViewTo(FVector WorldLookDirection, bool bSetTarget, FVector WorldTarget, float Distance, float Seconds)
++{
++	if (!SpringArmComponent)
++	{
++		return;
++	}
++	RememberStartViewIfNeeded();
++
++	const USceneComponent* Parent = SpringArmComponent->GetAttachParent();
++
++	// The spring arm's forward axis is the way the camera looks, so the look direction is its rotation.
++	FRotator EndRotation = SpringArmComponent->GetRelativeRotation();
++	if (!WorldLookDirection.IsNearlyZero())
++	{
++		const FQuat WorldRotation = WorldLookDirection.GetSafeNormal().ToOrientationQuat();
++		EndRotation = (Parent && !SpringArmComponent->IsUsingAbsoluteRotation())
++			? Parent->GetComponentTransform().InverseTransformRotation(WorldRotation).Rotator()
++			: WorldRotation.Rotator();
++		EndRotation.Pitch = FMath::Clamp(FRotator::NormalizeAxis(EndRotation.Pitch), MinPitch, MaxPitch);
++		EndRotation.Roll = 0.f;
++	}
++
++	FVector EndLocation = SpringArmComponent->GetRelativeLocation();
++	if (bSetTarget)
++	{
++		EndLocation = (Parent && !SpringArmComponent->IsUsingAbsoluteLocation())
++			? Parent->GetComponentTransform().InverseTransformPosition(WorldTarget)
++			: WorldTarget;
++	}
++
++	const float EndLength = Distance > 0.f ? FMath::Clamp(Distance, MinZoom, MaxZoom) : SpringArmComponent->TargetArmLength;
++	BeginViewMove(EndRotation, EndLocation, EndLength, Seconds);
++}
++
++void UCPP_MouseFunctionComp::GlideToDistance(float NewDistance, float Seconds)
++{
++	if (!SpringArmComponent)
++	{
++		return;
++	}
++	RememberStartViewIfNeeded();
++	// Keeps the rotation / target of a move that is already running (e.g. "show the biceps and zoom in").
++	BeginViewMove(bViewMoving ? MoveEndRotation : SpringArmComponent->GetRelativeRotation(),
++		bViewMoving ? MoveEndLocation : SpringArmComponent->GetRelativeLocation(),
++		FMath::Clamp(NewDistance, MinZoom, MaxZoom), Seconds);
++}
++
++void UCPP_MouseFunctionComp::GlideOrbitBy(float YawDegrees, float PitchDegrees, float Seconds)
++{
++	if (!SpringArmComponent)
++	{
++		return;
++	}
++	RememberStartViewIfNeeded();
++	FRotator EndRotation = bViewMoving ? MoveEndRotation : SpringArmComponent->GetRelativeRotation();
++	EndRotation.Yaw += YawDegrees;
++	EndRotation.Pitch = FMath::Clamp(EndRotation.Pitch + PitchDegrees, MinPitch, MaxPitch);
++	BeginViewMove(EndRotation, bViewMoving ? MoveEndLocation : SpringArmComponent->GetRelativeLocation(),
++		bViewMoving ? MoveEndLength : SpringArmComponent->TargetArmLength, Seconds);
++}
++
++void UCPP_MouseFunctionComp::GlideToStartView(float Seconds)
++{
++	if (!bHasStartView || !SpringArmComponent)
++	{
++		return;
++	}
++	BeginViewMove(StartArmRotation, StartArmLocation, StartArmLength, Seconds);
++}
++
++void UCPP_MouseFunctionComp::BeginViewMove(const FRotator& EndRotation, const FVector& EndLocation, float EndLength, float Seconds)
++{
++	UWorld* World = GetWorld();
++	if (!SpringArmComponent || !World)
++	{
++		return;
++	}
++	MoveBeginRotation = SpringArmComponent->GetRelativeRotation();
++	MoveBeginLocation = SpringArmComponent->GetRelativeLocation();
++	MoveBeginLength = SpringArmComponent->TargetArmLength;
++	MoveEndRotation = EndRotation;
++	MoveEndLocation = EndLocation;
++	MoveEndLength = EndLength;
++	MoveSeconds = Seconds;
++	MoveAlpha = 0.f;
++	MoveStartTime = World->GetRealTimeSeconds();
++	bViewMoving = true;
++
++	if (Seconds <= 0.f)
++	{
++		MoveAlpha = 1.f;
++		StepViewMove();   // jump there
++		return;
++	}
++	// A timer instead of a component tick: this component does not tick (it is input-driven), and Blueprint pawns
++	// made before this was added keep their saved tick settings.
++	World->GetTimerManager().SetTimer(ViewMoveTimer, this, &UCPP_MouseFunctionComp::StepViewMove, 1.f / 120.f, /*bLoop*/ true);
++}
++
++void UCPP_MouseFunctionComp::StepViewMove()
++{
++	UWorld* World = GetWorld();
++	if (!bViewMoving || !SpringArmComponent || !World)
++	{
++		CancelViewMove();
++		return;
++	}
++	if (MoveSeconds > 0.f && MoveAlpha < 1.f)
++	{
++		// From the clock, not added up per call: a timer faster than the frame rate fires several times a frame.
++		MoveAlpha = FMath::Clamp(static_cast<float>((World->GetRealTimeSeconds() - MoveStartTime) / MoveSeconds), 0.f, 1.f);
++	}
++	const float Eased = FMath::InterpEaseInOut(0.f, 1.f, MoveAlpha, 2.f);
++
++	// The short way round for the rotation (179 -> -179 is 2 degrees, not 358).
++	const FRotator Delta = (MoveEndRotation - MoveBeginRotation).GetNormalized();
++	SpringArmComponent->SetRelativeRotation(MoveBeginRotation + Delta * Eased);
++	SpringArmComponent->SetRelativeLocation(FMath::Lerp(MoveBeginLocation, MoveEndLocation, Eased));
++	SpringArmComponent->TargetArmLength = FMath::Lerp(MoveBeginLength, MoveEndLength, Eased);
++	SyncFromCurrentSpringArm();   // so a mouse orbit / zoom continues from here
++
++	if (MoveAlpha >= 1.f)
++	{
++		bViewMoving = false;
++		World->GetTimerManager().ClearTimer(ViewMoveTimer);
++	}
++}
++
++void UCPP_MouseFunctionComp::CancelViewMove()
++{
++	if (!bViewMoving)
++	{
++		return;
++	}
++	bViewMoving = false;
++	if (UWorld* World = GetWorld())
++	{
++		World->GetTimerManager().ClearTimer(ViewMoveTimer);
++	}
++	SyncFromCurrentSpringArm();
++}
+diff --git a/Source/MetaHumanTest/CPP_MouseFunctionComp.h b/Source/MetaHumanTest/CPP_MouseFunctionComp.h
+index 425098e..f40846f 100644
+--- a/Source/MetaHumanTest/CPP_MouseFunctionComp.h
++++ b/Source/MetaHumanTest/CPP_MouseFunctionComp.h
+@@ -5,6 +5,7 @@
+ 
+ #include "CoreMinimal.h"
+ #include "Components/ActorComponent.h"
++#include "Engine/TimerHandle.h"
+ #include "CPP_MouseFunctionComp.generated.h"
+ 
+ class USpringArmComponent;
+@@ -52,6 +53,37 @@ public:
+ 	UFUNCTION(BlueprintPure, Category="Mouse")
+ 	bool IsViewChanged() const;
+ 
++	// ---------------- Scripted camera moves (the assistant: "show me the biceps", "look from behind") ----------------
++
++	/** Glide the camera to a new view over Seconds (0 = at once).
++	 *  WorldLookDirection: the way the camera should look, in world space (from the camera towards the avatar);
++	 *                      a zero vector keeps the current direction.
++	 *  bSetTarget / WorldTarget: also move the point the camera orbits to this world position (false = keep it).
++	 *  Distance: camera distance in cm, clamped to MinZoom / MaxZoom (<= 0 = keep it).
++	 *  Any mouse / touch orbit, pan or zoom during the glide stops it where it is. */
++	UFUNCTION(BlueprintCallable, Category="Mouse")
++	void MoveViewTo(FVector WorldLookDirection, bool bSetTarget, FVector WorldTarget, float Distance, float Seconds = 0.6f);
++
++	/** Glide the camera closer / farther (clamped to MinZoom / MaxZoom). */
++	UFUNCTION(BlueprintCallable, Category="Mouse")
++	void GlideToDistance(float NewDistance, float Seconds = 0.35f);
++
++	/** Glide the camera around the avatar by these angles (degrees; pitch is clamped to MinPitch / MaxPitch). */
++	UFUNCTION(BlueprintCallable, Category="Mouse")
++	void GlideOrbitBy(float YawDegrees, float PitchDegrees, float Seconds = 0.5f);
++
++	/** Glide back to the start view (same as ResetView, but not a jump). */
++	UFUNCTION(BlueprintCallable, Category="Mouse")
++	void GlideToStartView(float Seconds = 0.6f);
++
++	/** True while a scripted move is running. */
++	UFUNCTION(BlueprintPure, Category="Mouse")
++	bool IsViewMoving() const { return bViewMoving; }
++
++	/** Where the camera is heading (or is, when no scripted move runs), cm. */
++	UFUNCTION(BlueprintPure, Category="Mouse")
++	float GetTargetCameraDistance() const { return bViewMoving ? MoveEndLength : CurrentCameraDistance; }
++
+ 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Mouse")
+ 	TObjectPtr<USpringArmComponent> SpringArmComponent = nullptr;
+ 
+@@ -100,4 +132,19 @@ private:
+ 	FRotator StartArmRotation = FRotator::ZeroRotator;
+ 	FVector StartArmLocation = FVector::ZeroVector;
+ 	float StartArmLength = 0.f;
++
++	// Scripted move (MoveViewTo and friends): from the Move Begin values to the Move End values, on a timer.
++	void BeginViewMove(const FRotator& EndRotation, const FVector& EndLocation, float EndLength, float Seconds);
++	void StepViewMove();
++	/** Stops a scripted move where it is (called by every user-driven orbit / pan / zoom). */
++	void CancelViewMove();
++
++	bool bViewMoving = false;
++	float MoveAlpha = 0.f;
++	float MoveSeconds = 0.f;
++	double MoveStartTime = 0.0;
++	FRotator MoveBeginRotation = FRotator::ZeroRotator, MoveEndRotation = FRotator::ZeroRotator;
++	FVector MoveBeginLocation = FVector::ZeroVector, MoveEndLocation = FVector::ZeroVector;
++	float MoveBeginLength = 0.f, MoveEndLength = 0.f;
++	FTimerHandle ViewMoveTimer;
+ };
+diff --git a/Source/MetaHumanTest/CPP_PlayerController.cpp b/Source/MetaHumanTest/CPP_PlayerController.cpp
+index a10ef06..45a004f 100644
+--- a/Source/MetaHumanTest/CPP_PlayerController.cpp
++++ b/Source/MetaHumanTest/CPP_PlayerController.cpp
+@@ -14,6 +14,7 @@
+ #include "WCPP_AnimationTimeline.h"
+ #include "IHPC_UI/CPP_UW_IHPCHud.h"
+ #include "PoseEstimation/PoseEstimationComp.h"
++#include "Assistant/IHPCAssistantComp.h"
+ #include "Components/StaticMeshComponent.h"
+ #include "Engine/StaticMesh.h"
+ #include "Engine/StaticMeshActor.h"
+@@ -28,6 +29,8 @@ ACPP_PlayerController::ACPP_PlayerController()
+ {
+ 	// On the controller (not the pawn) so it keeps running when the possessed pawn changes.
+ 	PoseEstimation = CreateDefaultSubobject<UPoseEstimationComp>(TEXT("PoseEstimation"));
++	// Also on the controller: the chat, the server connection and the conversation outlive a pawn switch.
++	Assistant = CreateDefaultSubobject<UIHPCAssistantComp>(TEXT("Assistant"));
+ }
+ 
+ void ACPP_PlayerController::BeginPlay()
+diff --git a/Source/MetaHumanTest/CPP_PlayerController.h b/Source/MetaHumanTest/CPP_PlayerController.h
+index f47a384..0b6fa90 100644
+--- a/Source/MetaHumanTest/CPP_PlayerController.h
++++ b/Source/MetaHumanTest/CPP_PlayerController.h
+@@ -20,6 +20,7 @@ class UCPP_UW_SpeedSlider;
+ class UWCPP_AnimationTimeline;
+ class UCPP_UW_IHPCHud;
+ class UPoseEstimationComp;
++class UIHPCAssistantComp;
+ 
+ UCLASS()
+ class METAHUMANTEST_API ACPP_PlayerController : public APlayerController
+@@ -38,6 +39,18 @@ public:
+ 	UFUNCTION(BlueprintPure, Category="Pose Estimation")
+ 	UPoseEstimationComp* GetPoseEstimation() const { return PoseEstimation; }
+ 
++	// ---------------- Assistant (the BOT chat) ----------------
++
++	/** The AI assistant behind the BOT chat: sends what is typed (or said while the BOT logo is held) to the AI server
++	 *  and runs the actions that come back - layers, timeline, camera, pose estimation, "show me the biceps".
++	 *  It also writes the description of a clicked muscle / bone into the chat box.
++	 *  Settings (server address...): select it in BP_PlayerController. See Assistant/IHPCAssistantComp.h. */
++	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Assistant")
++	TObjectPtr<UIHPCAssistantComp> Assistant;
++
++	UFUNCTION(BlueprintPure, Category="Assistant")
++	UIHPCAssistantComp* GetAssistant() const { return Assistant; }
++
+ 	// ---------------- Input ----------------
+ 
+ 	UPROPERTY(EditAnywhere, Category="Input")
+@@ -138,6 +151,10 @@ public:
+ 	UFUNCTION(BlueprintCallable, Category="Pawn Switching")
+ 	void SwitchToPawnIndex(int32 Index);
+ 
++	/** Index in SwitchablePawnClasses of the possessed pawn. */
++	UFUNCTION(BlueprintPure, Category="Pawn Switching")
++	int32 GetCurrentPawnIndex() const { return CurrentPawnIndex; }
++
+ 	/** Only the possessed pawn is shown: every other pawn in the level (the avatars you switched away from, or ones
+ 	 *  placed in the map) is hidden, at start and on every switch. A hidden avatar keeps its state (camera, layer,
+ 	 *  place in the animation) and comes back as it was. The static models of StaticModelFolders are hidden too. */
+diff --git a/Source/MetaHumanTest/MetaHumanTest.Build.cs b/Source/MetaHumanTest/MetaHumanTest.Build.cs
+index 57f6e2b..4171075 100644
+--- a/Source/MetaHumanTest/MetaHumanTest.Build.cs
++++ b/Source/MetaHumanTest/MetaHumanTest.Build.cs
+@@ -27,6 +27,11 @@ public class MetaHumanTest : ModuleRules
+ 			"RenderCore", // copying the game view back from the GPU
+ 			"RHI",
+ 			"ImageCore",  // loading / saving test images
++			// The AI assistant behind the BOT chat (Source/MetaHumanTest/*/Assistant)
++			"HTTP",             // requests to the AI server
++			"Json",             // the request and the answer
++			"AudioCaptureCore", // microphone for push-to-talk (hold the BOT logo)
++			"AudioCapture",     // ... and the platform's capture code (engine plugin Audio Capture)
+ 		});
+ 
+ 		// The Sports2D models (.onnx) are read at runtime: ship them with packaged builds.
+diff --git a/Source/MetaHumanTest/Private/Assistant/IHPCAssistantActions.cpp b/Source/MetaHumanTest/Private/Assistant/IHPCAssistantActions.cpp
+new file mode 100644
+index 0000000..944dcc7
+--- /dev/null
++++ b/Source/MetaHumanTest/Private/Assistant/IHPCAssistantActions.cpp
+@@ -0,0 +1,1005 @@
++// IHPCAssistantActions.cpp - what the assistant can DO: one function per action type of docs/PROTOCOL.md.
++// Every function returns whether it worked and, if not, one sentence for the user. Nothing here talks to the
++// server; "Assistant.Do <type> key=value ..." in the console runs the same code.
++
++#include "Assistant/IHPCAssistantComp.h"
++
++#include "../../CPP_MouseFunctionComp.h"    // module root (not on the include path)
++#include "../../CPP_PlayerController.h"
++#include "AnatomyPickerComp.h"
++#include "AnatomyViewComp.h"
++#include "AnimationTimelineComp.h"
++#include "IHPC_UI/CPP_UW_IHPCActionsPanel.h"
++#include "IHPC_UI/CPP_UW_IHPCHud.h"
++#include "IHPC_UI/CPP_UW_IHPCLayerSwitcher.h"
++#include "IHPC_UI/CPP_UW_IHPCSideBar.h"
++#include "IHPC_UI/CPP_UW_IHPCTimeline.h"
++#include "IHPC_UI/IHPCUILibrary.h"
++#include "MuscleAtlas.h"
++#include "PoseEstimation/PoseEstimationComp.h"
++
++#include "Camera/PlayerCameraManager.h"
++#include "Components/SkeletalMeshComponent.h"
++#include "Dom/JsonObject.h"
++#include "GameFramework/Pawn.h"
++
++namespace
++{
++	FIHPCActionResult Ok(const TCHAR* Type)
++	{
++		FIHPCActionResult Result;
++		Result.Type = Type;
++		Result.bOk = true;
++		return Result;
++	}
++
++	FIHPCActionResult Fail(const TCHAR* Type, const FString& Message)
++	{
++		FIHPCActionResult Result;
++		Result.Type = Type;
++		Result.bOk = false;
++		Result.Message = Message;
++		return Result;
++	}
++
++	// The answer comes from a language model: a number may arrive as "2", a flag as "true". Read them all the same.
++
++	FString GetText(const FJsonObject& Object, const TCHAR* Field)
++	{
++		FString Value;
++		Object.TryGetStringField(Field, Value);
++		return Value.TrimStartAndEnd();
++	}
++
++	bool GetNumber(const FJsonObject& Object, const TCHAR* Field, double& OutValue)
++	{
++		if (Object.TryGetNumberField(Field, OutValue))
++		{
++			return true;
++		}
++		FString Text;
++		if (Object.TryGetStringField(Field, Text) && Text.IsNumeric())
++		{
++			OutValue = FCString::Atod(*Text);
++			return true;
++		}
++		return false;
++	}
++
++	double GetNumberOr(const FJsonObject& Object, const TCHAR* Field, double Default)
++	{
++		double Value = Default;
++		GetNumber(Object, Field, Value);
++		return Value;
++	}
++
++	bool GetFlag(const FJsonObject& Object, const TCHAR* Field, bool& OutValue)
++	{
++		if (Object.TryGetBoolField(Field, OutValue))
++		{
++			return true;
++		}
++		FString Text;
++		if (Object.TryGetStringField(Field, Text))
++		{
++			OutValue = Text.ToBool();
++			return true;
++		}
++		double Number = 0.0;
++		if (Object.TryGetNumberField(Field, Number))
++		{
++			OutValue = Number != 0.0;
++			return true;
++		}
++		return false;
++	}
++
++	FString FormatSpeed(float Speed)
++	{
++		return FString::Printf(TEXT("x%s"), *FString::SanitizeFloat(Speed, 0));
++	}
++
++	const TCHAR* Degree = TEXT("°");
++}
++
++FIHPCActionResult UIHPCAssistantComp::RunAction(const TSharedPtr<FJsonObject>& Action)
++{
++	if (!Action.IsValid())
++	{
++		return Fail(TEXT("?"), TEXT("That action was not readable."));
++	}
++	const FString Type = GetText(*Action, TEXT("type")).ToLower();
++
++	FIHPCActionResult Result;
++	if (Type == TEXT("set_layer"))            { Result = DoSetLayer(*Action); }
++	else if (Type == TEXT("timeline"))        { Result = DoTimeline(*Action); }
++	else if (Type == TEXT("camera"))          { Result = DoCamera(*Action); }
++	else if (Type == TEXT("pose_estimation")) { Result = DoPoseEstimation(*Action); }
++	else if (Type == TEXT("read_pose_data"))  { Result = DoReadPoseData(*Action); }
++	else if (Type == TEXT("show_part"))       { Result = DoShowPart(*Action); }
++	else if (Type == TEXT("clear_selection")) { Result = DoClearSelection(*Action); }
++	else if (Type == TEXT("play_action"))     { Result = DoPlayAction(*Action); }
++	else if (Type == TEXT("open_panel"))      { Result = DoOpenPanel(*Action); }
++	else if (Type == TEXT("switch_avatar"))   { Result = DoSwitchAvatar(*Action); }
++	else
++	{
++		// A newer server may know actions this build does not: skip them, do the rest.
++		Result = Fail(*Type, FString::Printf(TEXT("This version of the app does not know the action \"%s\"."), *Type));
++	}
++
++	UE_LOG(LogIHPCAssistant, Log, TEXT("Action %s -> %s%s%s"), *Type, Result.bOk ? TEXT("ok") : TEXT("FAILED"),
++		Result.Message.IsEmpty() ? TEXT("") : TEXT(": "), *Result.Message);
++	return Result;
++}
++
++UCPP_MouseFunctionComp* UIHPCAssistantComp::GetCamera() const
++{
++	const APawn* Avatar = GetAvatar();
++	return Avatar ? Avatar->FindComponentByClass<UCPP_MouseFunctionComp>() : nullptr;
++}
++
++// ---------------------------------------------------------------------------
++// set_layer
++// ---------------------------------------------------------------------------
++
++FIHPCActionResult UIHPCAssistantComp::DoSetLayer(const FJsonObject& Action)
++{
++	const TCHAR* Type = TEXT("set_layer");
++	const FString Layer = GetText(Action, TEXT("layer")).ToLower();
++
++	EIHPCAnatomyLayer Wanted;
++	if (Layer == TEXT("body") || Layer == TEXT("skin"))                                   { Wanted = EIHPCAnatomyLayer::Body; }
++	else if (Layer == TEXT("muscles") || Layer == TEXT("muscle"))                         { Wanted = EIHPCAnatomyLayer::Muscles; }
++	else if (Layer == TEXT("skeleton") || Layer == TEXT("bones") || Layer == TEXT("bone")) { Wanted = EIHPCAnatomyLayer::Skeleton; }
++	else
++	{
++		return Fail(Type, FString::Printf(TEXT("I don't know a layer called \"%s\". The layers are body, muscles and skeleton."), *Layer));
++	}
++
++	// The side bar's three buttons do the work (and show which layer is on).
++	UCPP_UW_IHPCLayerSwitcher* Layers = GetHud() ? GetHud()->GetLayerSwitcher() : nullptr;
++	if (!Layers || !Layers->CanDriveAvatarLayers())
++	{
++		return Fail(Type, TEXT("This avatar has no anatomy layers."));
++	}
++	Layers->SelectLayer(Wanted);
++	return Ok(Type);
++}
++
++// ---------------------------------------------------------------------------
++// timeline
++// ---------------------------------------------------------------------------
++
++FIHPCActionResult UIHPCAssistantComp::DoTimeline(const FJsonObject& Action)
++{
++	const TCHAR* Type = TEXT("timeline");
++	const FString Op = GetText(Action, TEXT("op")).ToLower();
++
++	UAnimationTimelineComp* Animation = UIHPCUILibrary::FindAvatarTimeline(this);
++	if (!Animation)
++	{
++		return Fail(Type, TEXT("This avatar has no animation to control."));
++	}
++	// The bar at the bottom of the screen: going through it keeps its speed label and its markers right.
++	UCPP_UW_IHPCTimeline* Bar = GetHud() ? GetHud()->GetTimeline() : nullptr;
++
++	if (Op == TEXT("play") || Op == TEXT("resume"))
++	{
++		UIHPCUILibrary::PlayAvatar(this, /*bRestartIfAtEnd*/ true);
++		return Ok(Type);
++	}
++	if (Op == TEXT("pause") || Op == TEXT("stop"))
++	{
++		Animation->Pause();
++		return Ok(Type);
++	}
++	if (Op == TEXT("toggle"))
++	{
++		if (Animation->IsPlaying())
++		{
++			Animation->Pause();
++		}
++		else
++		{
++			UIHPCUILibrary::PlayAvatar(this, true);
++		}
++		return Ok(Type);
++	}
++	if (Op == TEXT("restart"))
++	{
++		UIHPCUILibrary::SeekAvatarTimeline(this, 0.f, /*bPauseAfterSeek*/ false);
++		return Ok(Type);
++	}
++	if (Op == TEXT("faster") || Op == TEXT("slower"))
++	{
++		const bool bFaster = Op == TEXT("faster");
++		const int32 Steps = FMath::Clamp(FMath::RoundToInt32(GetNumberOr(Action, TEXT("value"), 1.0)), 1, 10);
++		const float Before = Animation->PlaySpeed;
++		if (Bar)
++		{
++			for (int32 Step = 0; Step < Steps; ++Step)
++			{
++				bFaster ? Bar->SpeedUp() : Bar->SlowDown();
++			}
++		}
++		else
++		{
++			UIHPCUILibrary::SetAvatarPlaySpeed(this, FMath::Clamp(Before * FMath::Pow(bFaster ? 1.5f : 1.f / 1.5f, Steps), 0.1f, 4.f));
++		}
++		if (FMath::IsNearlyEqual(Animation->PlaySpeed, Before, 0.001f))
++		{
++			return Fail(Type, FString::Printf(TEXT("It is already at the %s speed (%s)."), bFaster ? TEXT("fastest") : TEXT("slowest"), *FormatSpeed(Before)));
++		}
++		return Ok(Type);
++	}
++	if (Op == TEXT("set_speed"))
++	{
++		double Wanted = 0.0;
++		if (!GetNumber(Action, TEXT("value"), Wanted) || Wanted <= 0.0)
++		{
++			return Fail(Type, TEXT("I need a speed, for example 0.5 or 2."));
++		}
++		if (Bar && Bar->SpeedSteps.Num() > 0)
++		{
++			// The bar steps through fixed speeds: take the nearest one.
++			int32 Best = 0;
++			for (int32 Index = 1; Index < Bar->SpeedSteps.Num(); ++Index)
++			{
++				if (FMath::Abs(Bar->SpeedSteps[Index] - Wanted) < FMath::Abs(Bar->SpeedSteps[Best] - Wanted))
++				{
++					Best = Index;
++				}
++			}
++			Bar->SetSpeedIndex(Best);
++		}
++		else
++		{
++			UIHPCUILibrary::SetAvatarPlaySpeed(this, static_cast<float>(FMath::Clamp(Wanted, 0.1, 4.0)));
++		}
++		return Ok(Type);
++	}
++	if (Op == TEXT("seek"))
++	{
++		double Where = 0.0;
++		if (!GetNumber(Action, TEXT("value"), Where))
++		{
++			return Fail(Type, TEXT("I need a position between 0 and 1."));
++		}
++		if (Where > 1.0 && Where <= 100.0)
++		{
++			Where /= 100.0;   // "50" was meant as a percentage
++		}
++		UIHPCUILibrary::SeekAvatarTimeline(this, static_cast<float>(FMath::Clamp(Where, 0.0, 1.0)), /*bPauseAfterSeek*/ false);
++		return Ok(Type);
++	}
++	if (Op == TEXT("step"))
++	{
++		const double Seconds = GetNumberOr(Action, TEXT("value"), 1.0 / 30.0);
++		Animation->StepSeconds(static_cast<float>(FMath::Clamp(Seconds, -10.0, 10.0)));
++		return Ok(Type);
++	}
++
++	// The rest only exists on the bar.
++	if (!Bar)
++	{
++		return Fail(Type, TEXT("The timeline bar is not on screen."));
++	}
++	if (Op == TEXT("next_marker"))
++	{
++		Bar->FastForwardToNextMarker();
++		return Ok(Type);
++	}
++	if (Op == TEXT("bookmark"))
++	{
++		Bar->AddBookmark();
++		return Ok(Type);
++	}
++	if (Op == TEXT("record_start"))
++	{
++		if (Bar->IsRecording())
++		{
++			return Fail(Type, TEXT("It is already recording."));
++		}
++		Bar->ToggleRecording();
++		return Ok(Type);
++	}
++	if (Op == TEXT("record_stop"))
++	{
++		if (!Bar->IsRecording())
++		{
++			return Fail(Type, TEXT("Nothing is being recorded."));
++		}
++		Bar->ToggleRecording();
++		return Ok(Type);
++	}
++	return Fail(Type, FString::Printf(TEXT("I don't know the timeline command \"%s\"."), *Op));
++}
++
++// ---------------------------------------------------------------------------
++// camera
++// ---------------------------------------------------------------------------
++
++namespace
++{
++	const FName BoneLeftArm(TEXT("upperarm_l")), BoneRightArm(TEXT("upperarm_r")), BonePelvis(TEXT("pelvis"));
++
++	/** The avatar's body mesh: the skeletal mesh with the MetaHuman arm bones, "Body" if there are several. */
++	const USkeletalMeshComponent* FindBodyMesh(const APawn* Avatar)
++	{
++		const USkeletalMeshComponent* Body = nullptr;
++		if (Avatar)
++		{
++			TArray<USkeletalMeshComponent*> Meshes;
++			Avatar->GetComponents<USkeletalMeshComponent>(Meshes);
++			for (const USkeletalMeshComponent* Mesh : Meshes)
++			{
++				if (Mesh && Mesh->GetBoneIndex(BoneLeftArm) != INDEX_NONE && Mesh->GetBoneIndex(BoneRightArm) != INDEX_NONE)
++				{
++					// The mesh that runs the animation (not a Leader Pose follower), "Body" on the MetaHumans.
++					if (!Body || Mesh->GetFName() == TEXT("Body"))
++					{
++						Body = Mesh;
++					}
++				}
++			}
++		}
++		return Body;
++	}
++
++	/**
++	 * Which side to look at a muscle or bone from (a horizontal direction pointing from the part towards the camera).
++	 *
++	 * A muscle lies on one side of the limb it belongs to: the biceps in front of the upper arm, the hamstrings behind
++	 * the thigh, the pectoral in front of the trunk. So: find the nearest limb (a line between two joints) and look
++	 * from the side of it the part is on. A part on the inside of a limb (the adductors on the inner thigh) would put
++	 * the camera on the far side of the body with the other leg in the way; those are looked at from the front or the
++	 * back instead. A part that sits on the limb's own line (the bones) has no side: front, turned a little towards
++	 * the side of the body it is on.
++	 */
++	FVector PickViewSide(const USkeletalMeshComponent* Body, const FVector& Centre, const FVector& Origin, const FVector& Forward, const FVector& Right)
++	{
++		// Which side of the body the part is on (zero near the middle: the spine, the breastbone).
++		const float Across = FVector::DotProduct(Centre - Origin, Right);
++		const FVector Outside = FMath::Abs(Across) > 4.f ? Right * FMath::Sign(Across) : FVector::ZeroVector;
++		const FVector FrontQuarter = (Forward + Outside * 0.6f).GetSafeNormal2D();
++		if (!Body)
++		{
++			return FrontQuarter;
++		}
++
++		// The limbs, as lines between joints (MetaHuman bone names).
++		static const TCHAR* Segments[][2] = {
++			{ TEXT("pelvis"), TEXT("neck_01") }, { TEXT("neck_01"), TEXT("head") },
++			{ TEXT("upperarm_l"), TEXT("lowerarm_l") }, { TEXT("lowerarm_l"), TEXT("hand_l") },
++			{ TEXT("upperarm_r"), TEXT("lowerarm_r") }, { TEXT("lowerarm_r"), TEXT("hand_r") },
++			{ TEXT("thigh_l"), TEXT("calf_l") }, { TEXT("calf_l"), TEXT("foot_l") }, { TEXT("foot_l"), TEXT("ball_l") },
++			{ TEXT("thigh_r"), TEXT("calf_r") }, { TEXT("calf_r"), TEXT("foot_r") }, { TEXT("foot_r"), TEXT("ball_r") },
++		};
++		FVector Offset = FVector::ZeroVector;   // from the nearest limb line to the part
++		float BestDistance2 = TNumericLimits<float>::Max();
++		for (const auto& Segment : Segments)
++		{
++			const FName From(Segment[0]), To(Segment[1]);
++			if (Body->GetBoneIndex(From) == INDEX_NONE || Body->GetBoneIndex(To) == INDEX_NONE)
++			{
++				continue;
++			}
++			const FVector OnLine = FMath::ClosestPointOnSegment(Centre, Body->GetBoneLocation(From), Body->GetBoneLocation(To));
++			const float Distance2 = FVector::DistSquared(Centre, OnLine);
++			if (Distance2 < BestDistance2)
++			{
++				BestDistance2 = Distance2;
++				Offset = Centre - OnLine;
++			}
++		}
++		if (Offset.Size2D() < 1.5f)
++		{
++			return FrontQuarter;   // on the line itself: a bone
++		}
++
++		const FVector Side = Offset.GetSafeNormal2D();
++		if (!Outside.IsZero() && FVector::DotProduct(Side, Outside) < -0.35f)
++		{
++			// It faces the middle of the body: from the front or the back, whichever it leans to.
++			const float Sign = FVector::DotProduct(Side, Forward) < -0.3f ? -1.f : 1.f;
++			return (Forward * Sign + Outside * 0.35f).GetSafeNormal2D();
++		}
++		return Side;
++	}
++}
++
++bool UIHPCAssistantComp::GetAvatarFrame(FVector& OutOrigin, FVector& OutForward, FVector& OutRight) const
++{
++	const APawn* Avatar = GetAvatar();
++	if (!Avatar)
++	{
++		return false;
++	}
++	OutOrigin = Avatar->GetActorLocation();
++	OutForward = Avatar->GetActorForwardVector();
++	OutRight = Avatar->GetActorRightVector();
++
++	// The body mesh knows better than the actor: the avatars are plain pawns whose mesh may face any way. The
++	// two upper arms give the avatar's right, and right x up = forward.
++	const FName LeftArm = BoneLeftArm, RightArm = BoneRightArm, Pelvis = BonePelvis;
++	const USkeletalMeshComponent* Body = FindBodyMesh(Avatar);
++	if (Body)
++	{
++		const FVector Across = (Body->GetBoneLocation(RightArm) - Body->GetBoneLocation(LeftArm)).GetSafeNormal2D();
++		if (!Across.IsNearlyZero())
++		{
++			OutRight = Across;
++			OutForward = FVector::CrossProduct(Across, FVector::UpVector).GetSafeNormal();
++		}
++		if (Body->GetBoneIndex(Pelvis) != INDEX_NONE)
++		{
++			OutOrigin = Body->GetBoneLocation(Pelvis);
++		}
++	}
++	return true;
++}
++
++FIHPCActionResult UIHPCAssistantComp::DoCamera(const FJsonObject& Action)
++{
++	const TCHAR* Type = TEXT("camera");
++	const FString Op = GetText(Action, TEXT("op")).ToLower();
++
++	UCPP_MouseFunctionComp* Camera = GetCamera();
++	if (!Camera)
++	{
++		return Fail(Type, TEXT("This avatar's camera can't be moved."));
++	}
++	const float Distance = Camera->GetTargetCameraDistance();
++
++	if (Op == TEXT("zoom_in") || Op == TEXT("zoom_out"))
++	{
++		const bool bIn = Op == TEXT("zoom_in");
++		const int32 Steps = FMath::Clamp(FMath::RoundToInt32(GetNumberOr(Action, TEXT("value"), 1.0)), 1, 12);
++		// One step: a quarter closer, or the same step back out.
++		const float Wanted = FMath::Clamp(Distance * FMath::Pow(bIn ? 0.75f : 1.f / 0.75f, Steps), Camera->MinZoom, Camera->MaxZoom);
++		if (FMath::IsNearlyEqual(Wanted, Distance, 0.5f))
++		{
++			return Fail(Type, bIn ? TEXT("The camera is already as close as it goes.") : TEXT("The camera is already as far away as it goes."));
++		}
++		Camera->GlideToDistance(Wanted, CameraMoveSeconds * 0.6f);
++		return Ok(Type);
++	}
++	if (Op == TEXT("zoom_to"))
++	{
++		double Amount = 0.0;
++		if (!GetNumber(Action, TEXT("value"), Amount))
++		{
++			return Fail(Type, TEXT("I need a zoom amount between 0 (far) and 1 (close)."));
++		}
++		Camera->GlideToDistance(FMath::Lerp(Camera->MaxZoom, Camera->MinZoom, static_cast<float>(FMath::Clamp(Amount, 0.0, 1.0))), CameraMoveSeconds);
++		return Ok(Type);
++	}
++	if (Op == TEXT("orbit"))
++	{
++		const float Yaw = static_cast<float>(FMath::Clamp(GetNumberOr(Action, TEXT("yaw"), 0.0), -360.0, 360.0));
++		const float Pitch = static_cast<float>(FMath::Clamp(GetNumberOr(Action, TEXT("pitch"), 0.0), -90.0, 90.0));
++		if (FMath::IsNearlyZero(Yaw) && FMath::IsNearlyZero(Pitch))
++		{
++			return Fail(Type, TEXT("I need to know how far to turn the camera."));
++		}
++		// The protocol counts the camera's own movement (+yaw = it moves to its right, +pitch = up); the spring arm
++		// turns the other way for that.
++		Camera->GlideOrbitBy(-Yaw, -Pitch, CameraMoveSeconds);
++		return Ok(Type);
++	}
++	if (Op == TEXT("view"))
++	{
++		const FString Side = GetText(Action, TEXT("value")).ToLower();
++		FVector Origin, Forward, Right;
++		if (!GetAvatarFrame(Origin, Forward, Right))
++		{
++			return Fail(Type, TEXT("There is no avatar to look at."));
++		}
++		// The way the camera looks: from that side towards the avatar, a little downwards.
++		FVector Look;
++		if (Side == TEXT("front"))                               { Look = -Forward; }
++		else if (Side == TEXT("back") || Side == TEXT("behind")) { Look = Forward; }
++		else if (Side == TEXT("left"))                           { Look = Right; }
++		else if (Side == TEXT("right"))                          { Look = -Right; }
++		else if (Side == TEXT("top") || Side == TEXT("above"))   { Look = -Forward * 0.15f - FVector::UpVector; }
++		else
++		{
++			return Fail(Type, FString::Printf(TEXT("I don't know the view \"%s\". Try front, back, left, right or top."), *Side));
++		}
++		if (Side != TEXT("top") && Side != TEXT("above"))
++		{
++			Look.Z = -0.1f;
++		}
++		Camera->MoveViewTo(Look, /*bSetTarget*/ false, FVector::ZeroVector, /*Distance*/ 0.f, CameraMoveSeconds);
++		return Ok(Type);
++	}
++	if (Op == TEXT("reset"))
++	{
++		Camera->GlideToStartView(CameraMoveSeconds);   // does nothing if the view was never moved: that is fine
++		return Ok(Type);
++	}
++	return Fail(Type, FString::Printf(TEXT("I don't know the camera command \"%s\"."), *Op));
++}
++
++// ---------------------------------------------------------------------------
++// pose_estimation, read_pose_data
++// ---------------------------------------------------------------------------
++
++FIHPCActionResult UIHPCAssistantComp::DoPoseEstimation(const FJsonObject& Action)
++{
++	const TCHAR* Type = TEXT("pose_estimation");
++	const ACPP_PlayerController* Controller = Cast<ACPP_PlayerController>(GetOwner());
++	UPoseEstimationComp* Pose = Controller ? Controller->GetPoseEstimation() : nullptr;
++	if (!Pose)
++	{
++		return Fail(Type, TEXT("Pose estimation is not part of this build."));
++	}
++
++	bool bEnabled = false, bOverlay = true, bShowPanel = false;
++	const bool bHasEnabled = GetFlag(Action, TEXT("enabled"), bEnabled);
++	const bool bHasOverlay = GetFlag(Action, TEXT("overlay"), bOverlay);
++	const bool bHasPanel = GetFlag(Action, TEXT("show_panel"), bShowPanel);
++
++	if (!bHasEnabled)
++	{
++		// Only the overlay / only the panel.
++		if (!bHasOverlay && !bHasPanel)
++		{
++			return Fail(Type, TEXT("I need to know whether to switch pose estimation on or off."));
++		}
++		if (bHasOverlay)
++		{
++			Pose->SetOverlayVisible(bOverlay);
++		}
++		if (bHasPanel)
++		{
++			Pose->SetDataPanelOpen(bShowPanel);
++		}
++		return Ok(Type);
++	}
++
++	if (bEnabled)
++	{
++		Pose->SetEstimationEnabled(true);
++		Pose->SetOverlayVisible(bHasOverlay ? bOverlay : true);
++		if (!bHasPanel || bShowPanel)
++		{
++			Pose->SetDataPanelOpen(true);   // the Pose Estimation side panel: the live graph and the angles
++		}
++		if (Pose->GetStatus() == EPoseEstimationStatus::Error)
++		{
++			return Fail(Type, FString::Printf(TEXT("Pose estimation could not start: %s"), *Pose->GetLastError()));
++		}
++	}
++	else
++	{
++		Pose->SetEstimationEnabled(false);
++		// The analysis keeps running while its panel is open, so "off" closes the panel too unless told not to.
++		if (Pose->IsDataPanelOpen() && (!bHasPanel || !bShowPanel))
++		{
++			Pose->SetDataPanelOpen(false);
++		}
++		bPoseReadPending = false;
++	}
++	return Ok(Type);
++}
++
++bool UIHPCAssistantComp::HasFreshPose() const
++{
++	const ACPP_PlayerController* Controller = Cast<ACPP_PlayerController>(GetOwner());
++	const UPoseEstimationComp* Pose = Controller ? Controller->GetPoseEstimation() : nullptr;
++	// "Fresh": a frame was analysed in the last second and a half (the result of an earlier run does not count).
++	return Pose && Pose->IsRunning() && LastPoseResultTime > 0.0 && FPlatformTime::Seconds() - LastPoseResultTime < 1.5;
++}
++
++FString UIHPCAssistantComp::FormatPoseData(const TArray<FString>& OnlyTheseAngles) const
++{
++	const ACPP_PlayerController* Controller = Cast<ACPP_PlayerController>(GetOwner());
++	const UPoseEstimationComp* Pose = Controller ? Controller->GetPoseEstimation() : nullptr;
++	const FPosePerson* Person = (Pose && HasFreshPose()) ? Pose->GetLatestResult().GetPrimary() : nullptr;
++	if (!Person)
++	{
++		return FString();
++	}
++
++	auto FindAngle = [Person](const FString& Name) -> const FPoseAngle*
++	{
++		const FName Wanted(*Name.ToLower());
++		return Person->Angles.FindByPredicate([Wanted](const FPoseAngle& Angle) { return Angle.Name == Wanted; });
++	};
++	auto Number = [](const FPoseAngle* Angle)
++	{
++		return FString::Printf(TEXT("%d%s"), FMath::RoundToInt32(Angle->Degrees), Degree);
++	};
++
++	TArray<FString> Lines;
++	if (OnlyTheseAngles.Num() > 0)
++	{
++		// Exactly what was asked for.
++		for (const FString& Name : OnlyTheseAngles)
++		{
++			const FPoseAngle* Angle = FindAngle(Name);
++			if (Angle && Angle->bValid)
++			{
++				Lines.Add(FString::Printf(TEXT("%s: %s"), *Name.ToLower(), *Number(Angle)));
++			}
++			else if (Angle)
++			{
++				Lines.Add(FString::Printf(TEXT("%s: not visible right now"), *Name.ToLower()));
++			}
++			else
++			{
++				Lines.Add(FString::Printf(TEXT("%s: not an angle I measure"), *Name.ToLower()));
++			}
++		}
++	}
++	else
++	{
++		// The main joints, right and left on one line.
++		static const TCHAR* Joints[] = { TEXT("knee"), TEXT("hip"), TEXT("ankle"), TEXT("shoulder"), TEXT("elbow") };
++		for (const TCHAR* Joint : Joints)
++		{
++			const FPoseAngle* RightAngle = FindAngle(FString::Printf(TEXT("right %s"), Joint));
++			const FPoseAngle* LeftAngle = FindAngle(FString::Printf(TEXT("left %s"), Joint));
++			TArray<FString> Sides;
++			if (RightAngle && RightAngle->bValid)
++			{
++				Sides.Add(TEXT("right ") + Number(RightAngle));
++			}
++			if (LeftAngle && LeftAngle->bValid)
++			{
++				Sides.Add(TEXT("left ") + Number(LeftAngle));
++			}
++			if (Sides.Num() > 0)
++			{
++				FString Label(Joint);
++				Label[0] = FChar::ToUpper(Label[0]);
++				Lines.Add(FString::Printf(TEXT("%s: %s"), *Label, *FString::Join(Sides, TEXT(", "))));
++			}
++		}
++		const FPoseAngle* Trunk = FindAngle(TEXT("trunk"));
++		if (Trunk && Trunk->bValid)
++		{
++			Lines.Add(FString::Printf(TEXT("Trunk: %s"), *Number(Trunk)));
++		}
++	}
++	if (Lines.Num() == 0)
++	{
++		return FString();
++	}
++	// The rate is an average over the last two seconds: it reads 0 for the first frames after switching on.
++	const float Rate = Pose->GetAnalysesPerSecond();
++	const FString Header = Rate >= 1.f ? FString::Printf(TEXT("Pose data now (%.0f frames per second):"), Rate) : FString(TEXT("Pose data now:"));
++	return Header + TEXT("\n") + FString::Join(Lines, TEXT("\n"));
++}
++
++FIHPCActionResult UIHPCAssistantComp::DoReadPoseData(const FJsonObject& Action)
++{
++	const TCHAR* Type = TEXT("read_pose_data");
++	const ACPP_PlayerController* Controller = Cast<ACPP_PlayerController>(GetOwner());
++	const UPoseEstimationComp* Pose = Controller ? Controller->GetPoseEstimation() : nullptr;
++	if (!Pose)
++	{
++		return Fail(Type, TEXT("Pose estimation is not part of this build."));
++	}
++	if (!Pose->IsRunning())
++	{
++		return Fail(Type, TEXT("Pose estimation is off. Ask me to start it first."));
++	}
++
++	TArray<FString> Angles;
++	const TArray<TSharedPtr<FJsonValue>>* AngleValues = nullptr;
++	if (Action.TryGetArrayField(TEXT("angles"), AngleValues) && AngleValues)
++	{
++		for (const TSharedPtr<FJsonValue>& Value : *AngleValues)
++		{
++			FString Name;
++			if (Value.IsValid() && Value->TryGetString(Name) && !Name.TrimStartAndEnd().IsEmpty())
++			{
++				Angles.Add(Name.TrimStartAndEnd());
++			}
++		}
++	}
++
++	const FString Text = FormatPoseData(Angles);
++	if (!Text.IsEmpty())
++	{
++		Say(Text, /*bOpenChat*/ true);
++		return Ok(Type);
++	}
++
++	// Just switched on (the models take a second or two to load), or nobody in view yet: answer when a frame arrives.
++	bPoseReadPending = true;
++	PoseReadDeadline = FPlatformTime::Seconds() + PoseReadTimeout;
++	PoseReadAngles = MoveTemp(Angles);
++	return Ok(Type);
++}
++
++// ---------------------------------------------------------------------------
++// show_part, clear_selection
++// ---------------------------------------------------------------------------
++
++const FIHPCPartRef* UIHPCAssistantComp::FindPart(const FString& Kind, const FString& Name, const FString& Side) const
++{
++	const FString Key = NormalizeName(Name);
++	if (Key.IsEmpty())
++	{
++		return nullptr;
++	}
++	auto KindFits = [&Kind](const FIHPCPartRef& Part) { return Kind.IsEmpty() || Part.Kind == Kind; };
++
++	// 1. The name as the atlas has it. 2. A name that contains what was asked ("biceps" -> "Biceps brachii"),
++	//    the shortest such name first, so "deltoid" does not become a longer muscle that merely mentions it.
++	FString MatchedKey, MatchedKind;
++	for (const FIHPCPartRef& Part : Parts)
++	{
++		if (KindFits(Part) && Part.Key == Key)
++		{
++			MatchedKey = Part.Key;
++			MatchedKind = Part.Kind;
++			break;
++		}
++	}
++	if (MatchedKey.IsEmpty())
++	{
++		for (const FIHPCPartRef& Part : Parts)
++		{
++			if (KindFits(Part) && Part.Key.Contains(Key) && (MatchedKey.IsEmpty() || Part.Key.Len() < MatchedKey.Len()))
++			{
++				MatchedKey = Part.Key;
++				MatchedKind = Part.Kind;
++			}
++		}
++	}
++	if (MatchedKey.IsEmpty())
++	{
++		return nullptr;
++	}
++
++	// Every side of that name.
++	TArray<const FIHPCPartRef*> Candidates;
++	for (const FIHPCPartRef& Part : Parts)
++	{
++		if (Part.Kind == MatchedKind && Part.Key == MatchedKey && Part.Picker.IsValid())
++		{
++			Candidates.Add(&Part);
++		}
++	}
++	if (Candidates.Num() == 0)
++	{
++		return nullptr;
++	}
++
++	// The side that was asked for, if the part has it.
++	const FString Lower = Side.TrimStartAndEnd().ToLower();
++	if (Lower == TEXT("left") || Lower == TEXT("right") || Lower == TEXT("center") || Lower == TEXT("centre"))
++	{
++		const FString Wanted = NormalizeSide(Lower);
++		for (const FIHPCPartRef* Candidate : Candidates)
++		{
++			if (Candidate->Side == Wanted)
++			{
++				return Candidate;
++			}
++		}
++	}
++	if (Candidates.Num() == 1)
++	{
++		return Candidates[0];
++	}
++
++	// No side given: the one the user can see best, i.e. the one nearer to the camera.
++	const APlayerController* Controller = Cast<APlayerController>(GetOwner());
++	if (!Controller || !Controller->PlayerCameraManager)
++	{
++		return Candidates[0];
++	}
++	const FVector Eye = Controller->PlayerCameraManager->GetCameraLocation();
++	const FIHPCPartRef* Nearest = Candidates[0];
++	float NearestDistance2 = TNumericLimits<float>::Max();
++	for (const FIHPCPartRef* Candidate : Candidates)
++	{
++		FVector Centre;
++		float Radius = 0.f;
++		if (Candidate->Picker->GetMuscleWorldLocation(Candidate->Id, Centre, Radius))
++		{
++			const float Distance2 = FVector::DistSquared(Centre, Eye);
++			if (Distance2 < NearestDistance2)
++			{
++				NearestDistance2 = Distance2;
++				Nearest = Candidate;
++			}
++		}
++	}
++	return Nearest;
++}
++
++FIHPCActionResult UIHPCAssistantComp::DoShowPart(const FJsonObject& Action)
++{
++	const TCHAR* Type = TEXT("show_part");
++	FString Kind = GetText(Action, TEXT("kind")).ToLower();
++	const FString Name = GetText(Action, TEXT("name"));
++	const FString Side = GetText(Action, TEXT("side"));
++	if (Kind != TEXT("muscle") && Kind != TEXT("bone"))
++	{
++		Kind.Reset();   // not said: look through both
++	}
++
++	if (Parts.Num() == 0)
++	{
++		return Fail(Type, TEXT("This avatar has no muscles or bones I can point at."));
++	}
++	const FIHPCPartRef* Part = FindPart(Kind, Name, Side);
++	if (!Part && !Kind.IsEmpty())
++	{
++		Part = FindPart(FString(), Name, Side);   // "the femur muscle": the name decides
++	}
++	UAnatomyPickerComp* Picker = Part ? Part->Picker.Get() : nullptr;
++	if (!Picker)
++	{
++		return Fail(Type, FString::Printf(TEXT("This avatar has no %s called \"%s\"."), Kind.IsEmpty() ? TEXT("muscle or bone") : *Kind, *Name));
++	}
++	const int32 PartId = Part->Id;
++	const bool bBone = Part->Kind == TEXT("bone");
++
++	bool bDescribe = true, bFocus = true;
++	GetFlag(Action, TEXT("describe"), bDescribe);
++	GetFlag(Action, TEXT("focus"), bFocus);
++
++	// 1. The layer the part is on.
++	const EIHPCAnatomyLayer Wanted = bBone ? EIHPCAnatomyLayer::Skeleton : EIHPCAnatomyLayer::Muscles;
++	UCPP_UW_IHPCLayerSwitcher* Layers = GetHud() ? GetHud()->GetLayerSwitcher() : nullptr;
++	if (Layers && Layers->CanDriveAvatarLayers())
++	{
++		if (Layers->GetSelectedLayer() != Wanted)
++		{
++			Layers->SelectLayer(Wanted);
++		}
++	}
++	else if (UAnatomyViewComp* View = GetAvatar() ? GetAvatar()->FindComponentByClass<UAnatomyViewComp>() : nullptr)
++	{
++		View->ShowLayerByName(Picker->RequiredLayerName);   // no HUD: drive the avatar directly
++	}
++
++	// 2. One highlighted part at a time, across the layers.
++	for (const TWeakObjectPtr<UAnatomyPickerComp>& Other : Pickers)
++	{
++		if (Other.IsValid() && Other.Get() != Picker)
++		{
++			Other->ClearSelection();
++		}
++	}
++
++	// 3. Highlight it. A new selection writes the description into the chat (HandlePartSelectionChanged); a part
++	//    that was already highlighted does not fire that event, so it is described here.
++	const bool bWasSelected = Picker->GetSelectedMuscle() == PartId;
++	const bool bWasDescribing = bDescribeClickedParts;
++	bDescribeClickedParts = bDescribe && bWasDescribing;
++	Picker->SelectById(PartId);
++	bDescribeClickedParts = bWasDescribing;
++	if (bDescribe && (bWasSelected || !bWasDescribing))
++	{
++		DescribePart(Picker, PartId);
++	}
++
++	// 4. Turn the camera to it.
++	UCPP_MouseFunctionComp* Camera = GetCamera();
++	FVector Centre;
++	float Radius = 0.f;
++	if (bFocus && Camera && Picker->GetMuscleWorldLocation(PartId, Centre, Radius))
++	{
++		FVector Origin, Forward, Right;
++		GetAvatarFrame(Origin, Forward, Right);
++		const FVector From = PickViewSide(FindBodyMesh(GetAvatar()), Centre, Origin, Forward, Right);
++		FVector Look = -From;   // the camera looks back at the part from that side ...
++		Look.Z = -0.12f;        // ... a little from above
++
++		const float Distance = FMath::Max(FocusMinDistance, Radius * FocusDistanceScale + FocusDistanceExtra);
++		Camera->MoveViewTo(Look, /*bSetTarget*/ true, Centre, Distance, CameraMoveSeconds);
++	}
++	return Ok(Type);
++}
++
++FIHPCActionResult UIHPCAssistantComp::DoClearSelection(const FJsonObject& Action)
++{
++	for (const TWeakObjectPtr<UAnatomyPickerComp>& Picker : Pickers)
++	{
++		if (Picker.IsValid())
++		{
++			Picker->ClearSelection();
++		}
++	}
++	return Ok(TEXT("clear_selection"));
++}
++
++// ---------------------------------------------------------------------------
++// play_action, open_panel, switch_avatar
++// ---------------------------------------------------------------------------
++
++FIHPCActionResult UIHPCAssistantComp::DoPlayAction(const FJsonObject& Action)
++{
++	const TCHAR* Type = TEXT("play_action");
++	const FString Name = GetText(Action, TEXT("name"));
++	UCPP_UW_IHPCActionsPanel* Panel = GetHud() ? GetHud()->GetActionsPanel() : nullptr;
++	if (!Panel)
++	{
++		return Fail(Type, TEXT("The action list is not on screen."));
++	}
++
++	// "running", "Running" and "tennis forehand" all find their card.
++	const FString Key = NormalizeName(Name);
++	FName Target = NAME_None;
++	const TArray<FName> Available = Panel->GetAvailableActions();
++	for (const FName& Candidate : Available)
++	{
++		if (NormalizeName(Candidate.ToString()) == Key)
++		{
++			Target = Candidate;
++			break;
++		}
++	}
++	if (Target.IsNone())
++	{
++		TArray<FString> Names;
++		for (const FName& Candidate : Available)
++		{
++			Names.Add(Candidate.ToString());
++		}
++		return Fail(Type, FString::Printf(TEXT("This avatar can't do \"%s\". It can do: %s."), *Name, *FString::Join(Names, TEXT(", "))));
++	}
++
++	// Selecting the card that is already on would switch it off again (a second click = back to Idle).
++	if (Panel->GetHighlightedAction() != Target)
++	{
++		Panel->SelectAction(Target);
++	}
++	if (Panel->GetHighlightedAction() != Target)
++	{
++		return Fail(Type, FString::Printf(TEXT("\"%s\" did not start on this avatar."), *Target.ToString()));
++	}
++	return Ok(Type);
++}
++
++FIHPCActionResult UIHPCAssistantComp::DoOpenPanel(const FJsonObject& Action)
++{
++	const TCHAR* Type = TEXT("open_panel");
++	const FString Panel = GetText(Action, TEXT("panel")).ToLower();
++	UCPP_UW_IHPCHud* HudWidget = GetHud();
++	if (!HudWidget)
++	{
++		return Fail(Type, TEXT("The side panels are not on screen."));
++	}
++
++	EIHPCSideTab Tab;
++	if (Panel == TEXT("none") || Panel == TEXT("close") || Panel.IsEmpty())       { Tab = EIHPCSideTab::None; }
++	else if (Panel == TEXT("actions") || Panel == TEXT("action"))                 { Tab = EIHPCSideTab::Actions; }
++	else if (Panel == TEXT("pose_estimation") || Panel == TEXT("pose"))           { Tab = EIHPCSideTab::PoseEstimation; }
++	else if (Panel == TEXT("graphs") || Panel == TEXT("graph"))                   { Tab = EIHPCSideTab::Graphs; }
++	else if (Panel == TEXT("timeline"))                                           { Tab = EIHPCSideTab::Timeline; }
++	else if (Panel == TEXT("saved_videos") || Panel == TEXT("videos"))            { Tab = EIHPCSideTab::SavedVideos; }
++	else if (Panel == TEXT("settings"))                                           { Tab = EIHPCSideTab::Settings; }
++	else
++	{
++		return Fail(Type, FString::Printf(TEXT("There is no panel called \"%s\"."), *Panel));
++	}
++	HudWidget->SelectSideTab(Tab);
++	return Ok(Type);
++}
++
++FIHPCActionResult UIHPCAssistantComp::DoSwitchAvatar(const FJsonObject& Action)
++{
++	const TCHAR* Type = TEXT("switch_avatar");
++	ACPP_PlayerController* Controller = Cast<ACPP_PlayerController>(GetOwner());
++	if (!Controller || Controller->SwitchablePawnClasses.Num() < 2)
++	{
++		return Fail(Type, TEXT("There is only one avatar."));
++	}
++	const FString Direction = GetText(Action, TEXT("direction")).ToLower();
++	const APawn* Before = Controller->GetPawn();
++	Controller->SwitchPawn((Direction == TEXT("previous") || Direction == TEXT("prev") || Direction == TEXT("back")) ? -1 : 1);
++	if (Controller->GetPawn() == Before)
++	{
++		return Fail(Type, TEXT("The other avatar could not be shown."));
++	}
++	return Ok(Type);
++}
+diff --git a/Source/MetaHumanTest/Private/Assistant/IHPCAssistantComp.cpp b/Source/MetaHumanTest/Private/Assistant/IHPCAssistantComp.cpp
+new file mode 100644
+index 0000000..61cdf8d
+--- /dev/null
++++ b/Source/MetaHumanTest/Private/Assistant/IHPCAssistantComp.cpp
+@@ -0,0 +1,1117 @@
++// IHPCAssistantComp.cpp - the assistant behind the BOT chat: start-up, the chat box, the request queue, HTTP and
++// what is done with the server's answer. See the header for the overview.
++
++#include "Assistant/IHPCAssistantComp.h"
++
++#include "IHPCAssistantVoice.h"
++#include "../../CPP_PlayerController.h"    // module root (not on the include path)
++#include "AnatomyPickerComp.h"
++#include "IHPC_UI/CPP_UW_IHPCChatPanel.h"
++#include "IHPC_UI/CPP_UW_IHPCHud.h"
++#include "IHPC_UI/CPP_UW_IHPCSideBar.h"
++#include "MuscleAtlas.h"
++#include "PoseEstimation/PoseEstimationComp.h"
++
++#include "Dom/JsonObject.h"
++#include "Engine/World.h"
++#include "GameFramework/Pawn.h"
++#include "HAL/IConsoleManager.h"
++#include "HttpModule.h"
++#include "Interfaces/IHttpResponse.h"
++#include "Misc/CommandLine.h"
++#include "Misc/ConfigCacheIni.h"
++#include "Misc/FileHelper.h"
++#include "Misc/Guid.h"
++#include "Misc/Paths.h"
++#include "Serialization/JsonReader.h"
++#include "Serialization/JsonSerializer.h"
++
++DEFINE_LOG_CATEGORY(LogIHPCAssistant);
++
++namespace
++{
++	// Where "/server" and "/key" are remembered: GameUserSettings.ini of this computer, not the project.
++	const TCHAR* ConfigSection = TEXT("IHPCAssistant");
++
++	void AppendUtf8(TArray<uint8>& Out, const FString& Text)
++	{
++		const FTCHARToUTF8 Utf8(*Text);
++		Out.Append(reinterpret_cast<const uint8*>(Utf8.Get()), Utf8.Length());
++	}
++
++	TSharedPtr<FJsonObject> ParseJson(const FString& Text)
++	{
++		TSharedPtr<FJsonObject> Object;
++		const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Text);
++		if (!FJsonSerializer::Deserialize(Reader, Object))
++		{
++			Object.Reset();
++		}
++		return Object;
++	}
++
++	/** "set_layer layer=muscles" -> {"type":"set_layer","layer":"muscles"}. The console strips the quotes from real
++	 *  JSON, so this plainer form is what can be typed there (and after "/do" in the chat box). Numbers and
++	 *  true / false stay what they are. */
++	FString ActionJsonFromWords(const TArray<FString>& Words)
++	{
++		const TSharedRef<FJsonObject> Action = MakeShared<FJsonObject>();
++		for (int32 Index = 0; Index < Words.Num(); ++Index)
++		{
++			FString Key, Value;
++			if (Index == 0 && !Words[Index].Contains(TEXT("=")))
++			{
++				Action->SetStringField(TEXT("type"), Words[Index]);
++			}
++			else if (Words[Index].Split(TEXT("="), &Key, &Value))
++			{
++				if (Value.IsNumeric())
++				{
++					Action->SetNumberField(Key, FCString::Atod(*Value));
++				}
++				else if (Value == TEXT("true") || Value == TEXT("false"))
++				{
++					Action->SetBoolField(Key, Value == TEXT("true"));
++				}
++				else
++				{
++					// Only a name has spaces ("Biceps brachii"); "zoom_in" and "pose_estimation" keep their underscore.
++					Action->SetStringField(Key, Key == TEXT("name") ? Value.Replace(TEXT("_"), TEXT(" ")) : Value);
++				}
++			}
++		}
++		FString Out;
++		const TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&Out);
++		FJsonSerializer::Serialize(Action, Writer);
++		return Out;
++	}
++
++	const TCHAR* HelpText =
++		TEXT("Type or hold my logo and talk. For example:\n")
++		TEXT("- show the muscles / the skeleton / the body\n")
++		TEXT("- show me the left biceps, highlight the femur\n")
++		TEXT("- play, pause, faster, half speed, go to the middle\n")
++		TEXT("- zoom in, look from behind, reset the view\n")
++		TEXT("- start pose estimation and read the data\n")
++		TEXT("Commands: /server <address>, /key <text>, /status, /clear, /do <action> key=value");
++}
++
++UIHPCAssistantComp::UIHPCAssistantComp()
++{
++	PrimaryComponentTick.bCanEverTick = true;   // finds the HUD, feeds the microphone, waits for pose data
++	PrimaryComponentTick.bStartWithTickEnabled = true;
++}
++
++void UIHPCAssistantComp::BeginPlay()
++{
++	Super::BeginPlay();
++
++	SessionId = FGuid::NewGuid().ToString(EGuidFormats::Digits).ToLower();
++	UE_LOG(LogIHPCAssistant, Log, TEXT("Assistant ready. Server: %s%s. Session %s"), *GetServerURL(),
++		GetApiKey().IsEmpty() ? TEXT(" (no key)") : TEXT(" (with key)"), *SessionId);
++
++	if (bCheckServerOnBeginPlay)
++	{
++		CheckServer(/*bToChat*/ false);
++	}
++}
++
++void UIHPCAssistantComp::EndPlay(const EEndPlayReason::Type EndPlayReason)
++{
++	if (Recorder.IsValid())
++	{
++		Recorder->Abort();   // closes the microphone
++		Recorder.Reset();
++	}
++	BindToPawn(nullptr);
++	Queue.Reset();
++	Super::EndPlay(EndPlayReason);
++}
++
++void UIHPCAssistantComp::TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction)
++{
++	Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
++
++	// 1. The HUD is created by the controller after this component begins play: look for it until it is there.
++	if (!Hud.IsValid())
++	{
++		HudSearchCooldown -= DeltaTime;
++		if (HudSearchCooldown <= 0.f)
++		{
++			HudSearchCooldown = 0.25f;
++			EnsureHud();
++		}
++	}
++
++	// 2. Follow the possessed pawn (Abby -> Beau -> ...): its pickers, its muscle and bone names.
++	APawn* Avatar = GetAvatar();
++	if (Avatar != BoundPawn.Get())
++	{
++		BindToPawn(Avatar);
++	}
++	else if (Avatar && Parts.Num() == 0)
++	{
++		// The pickers load their atlas in their own Begin Play, which may come after ours: try again now and then.
++		RebindCooldown -= DeltaTime;
++		if (RebindCooldown <= 0.f)
++		{
++			RebindCooldown = 1.f;
++			BindToPawn(Avatar);
++		}
++	}
++
++	// 3. Push-to-talk: move the microphone's audio into the recording, show its loudness on the logo.
++	if (IsRecording())
++	{
++		const float Level = Recorder->Poll();
++		if (UCPP_UW_IHPCSideBar* SideBar = GetSideBar())
++		{
++			SideBar->SetBotInputLevel(Level);
++		}
++		if (FPlatformTime::Seconds() - RecordStartTime >= MaxRecordSeconds)
++		{
++			StopVoiceAndSend();   // talked long enough: send what there is
++		}
++	}
++
++	// 4. "Read the pose data" asked before the first analysed frame.
++	if (bPoseReadPending)
++	{
++		const FString Text = FormatPoseData(PoseReadAngles);
++		if (!Text.IsEmpty())
++		{
++			bPoseReadPending = false;
++			Say(Text, /*bOpenChat*/ true);
++		}
++		else if (FPlatformTime::Seconds() >= PoseReadDeadline)
++		{
++			bPoseReadPending = false;
++			Say(TEXT("Pose estimation is on, but it does not see a person yet. Make sure the whole avatar is in view, then ask me to read the data again."), true);
++		}
++	}
++}
++
++// ---------------------------------------------------------------------------
++// HUD and pawn hook-up
++// ---------------------------------------------------------------------------
++
++APawn* UIHPCAssistantComp::GetAvatar() const
++{
++	const APlayerController* Controller = Cast<APlayerController>(GetOwner());
++	return Controller ? Controller->GetPawn() : nullptr;
++}
++
++UCPP_UW_IHPCChatPanel* UIHPCAssistantComp::GetChat() const
++{
++	return Hud.IsValid() ? Hud->GetChatPanel() : nullptr;
++}
++
++UCPP_UW_IHPCSideBar* UIHPCAssistantComp::GetSideBar() const
++{
++	return Hud.IsValid() ? Hud->GetSideBar() : nullptr;
++}
++
++void UIHPCAssistantComp::EnsureHud()
++{
++	const ACPP_PlayerController* Controller = Cast<ACPP_PlayerController>(GetOwner());
++	UCPP_UW_IHPCHud* HudWidget = Controller ? Controller->GetMainHUD() : nullptr;
++	if (!HudWidget)
++	{
++		return;
++	}
++	Hud = HudWidget;
++
++	if (UCPP_UW_IHPCChatPanel* Chat = HudWidget->GetChatPanel())
++	{
++		// Typing + Enter (or the send button). The panel has already added the user's bubble.
++		Chat->OnMessageSent.AddUniqueDynamic(this, &UIHPCAssistantComp::HandleChatMessageSent);
++	}
++	if (UCPP_UW_IHPCSideBar* SideBar = HudWidget->GetSideBar())
++	{
++		// Holding the BOT logo = push-to-talk.
++		SideBar->OnBotVoiceHoldStarted.AddUniqueDynamic(this, &UIHPCAssistantComp::HandleBotVoiceHoldStarted);
++		SideBar->OnBotVoiceHoldEnded.AddUniqueDynamic(this, &UIHPCAssistantComp::HandleBotVoiceHoldEnded);
++	}
++	if (UPoseEstimationComp* Pose = Controller->GetPoseEstimation())
++	{
++		if (!bPoseEventBound)
++		{
++			bPoseEventBound = true;
++			Pose->OnPoseEstimated.AddUniqueDynamic(this, &UIHPCAssistantComp::HandlePoseEstimated);
++		}
++	}
++
++	// Anything said before the chat box existed.
++	TArray<FString> Waiting = MoveTemp(SayBeforeHud);
++	SayBeforeHud.Reset();
++	for (const FString& Text : Waiting)
++	{
++		Say(Text);
++	}
++}
++
++void UIHPCAssistantComp::BindToPawn(APawn* Pawn)
++{
++	for (const TWeakObjectPtr<UAnatomyPickerComp>& Old : Pickers)
++	{
++		if (Old.IsValid())
++		{
++			Old->OnSelectionChanged.RemoveDynamic(this, &UIHPCAssistantComp::HandlePartSelectionChanged);
++		}
++	}
++	Pickers.Reset();
++	LastSelected.Reset();
++	BoundPawn = Pawn;
++
++	TArray<UAnatomyPickerComp*> Found;
++	if (Pawn)
++	{
++		Pawn->GetComponents<UAnatomyPickerComp>(Found);
++	}
++	for (UAnatomyPickerComp* Picker : Found)
++	{
++		// One picker per pickable layer (muscles, bones). A click on a part = OnSelectionChanged.
++		Picker->OnSelectionChanged.AddUniqueDynamic(this, &UIHPCAssistantComp::HandlePartSelectionChanged);
++		Pickers.Add(Picker);
++		LastSelected.Add(Picker, Picker->GetSelectedMuscle());   // what is already highlighted is not news
++	}
++	RebuildCatalog();
++}
++
++void UIHPCAssistantComp::HandlePoseEstimated(const FPoseFrameResult& Result)
++{
++	LastPoseResultTime = FPlatformTime::Seconds();
++}
++
++// ---------------------------------------------------------------------------
++// The chat box
++// ---------------------------------------------------------------------------
++
++void UIHPCAssistantComp::Say(const FString& Text, bool bOpenChat)
++{
++	if (Text.TrimStartAndEnd().IsEmpty())
++	{
++		return;
++	}
++	if (bDeferMessages)
++	{
++		DeferredMessages.Add(Text);   // lands after the reply (ApplyAnswer)
++		return;
++	}
++	UCPP_UW_IHPCChatPanel* Chat = GetChat();
++	if (!Chat)
++	{
++		SayBeforeHud.Add(Text);
++		UE_LOG(LogIHPCAssistant, Log, TEXT("(no chat box yet) %s"), *Text);
++		return;
++	}
++	UCPP_UW_IHPCSideBar* SideBar = GetSideBar();
++	if (bOpenChat && SideBar && !SideBar->IsChatOpen())
++	{
++		SideBar->SetChatOpen(true);
++	}
++	Chat->AddBotMessage(FText::FromString(Text));   // the side bar makes the BOT logo talk
++}
++
++void UIHPCAssistantComp::SetStatus(const FString& Text)
++{
++	if (UCPP_UW_IHPCChatPanel* Chat = GetChat())
++	{
++		Chat->SetStatus(FText::FromString(Text));
++	}
++}
++
++void UIHPCAssistantComp::Ask(const FString& Text)
++{
++	const FString Clean = Text.TrimStartAndEnd();
++	if (Clean.IsEmpty())
++	{
++		return;
++	}
++	EnsureHud();
++	if (UCPP_UW_IHPCChatPanel* Chat = GetChat())
++	{
++		if (UCPP_UW_IHPCSideBar* SideBar = GetSideBar())
++		{
++			if (!SideBar->IsChatOpen())
++			{
++				SideBar->SetChatOpen(true);   // so the answer is seen
++			}
++		}
++		Chat->SubmitMessage(FText::FromString(Clean));   // adds the bubble and comes back through HandleChatMessageSent
++	}
++	else
++	{
++		HandleChatMessageSent(FText::FromString(Clean));
++	}
++}
++
++void UIHPCAssistantComp::HandleChatMessageSent(const FText& Text)
++{
++	const FString Clean = Text.ToString().TrimStartAndEnd();
++	if (Clean.IsEmpty() || HandleSlashCommand(Clean))
++	{
++		return;
++	}
++	FRequest Request;
++	Request.Text = Clean;
++	Enqueue(MoveTemp(Request));
++}
++
++bool UIHPCAssistantComp::HandleSlashCommand(const FString& Text)
++{
++	if (!Text.StartsWith(TEXT("/")))
++	{
++		return false;
++	}
++	FString Command, Argument;
++	if (!Text.Split(TEXT(" "), &Command, &Argument))
++	{
++		Command = Text;
++	}
++	Command = Command.ToLower();
++	Argument = Argument.TrimStartAndEnd();
++
++	if (Command == TEXT("/server"))
++	{
++		if (!Argument.IsEmpty())
++		{
++			SetServerURL(Argument, /*bRemember*/ true);
++		}
++		Say(FString::Printf(TEXT("AI server: %s"), *GetServerURL()));
++		if (!Argument.IsEmpty())
++		{
++			CheckServer(/*bToChat*/ true);
++		}
++	}
++	else if (Command == TEXT("/key"))
++	{
++		if (!Argument.IsEmpty())
++		{
++			SetApiKey(Argument.Equals(TEXT("none"), ESearchCase::IgnoreCase) ? FString() : Argument, /*bRemember*/ true);
++		}
++		Say(GetApiKey().IsEmpty() ? TEXT("No key is set.") : TEXT("A key is set."));
++	}
++	else if (Command == TEXT("/status"))
++	{
++		Say(FString::Printf(TEXT("AI server: %s. Asking it..."), *GetServerURL()));
++		CheckServer(/*bToChat*/ true);
++	}
++	else if (Command == TEXT("/do"))
++	{
++		// A test command: run one action here, without the AI server. "/do camera op=view value=back"
++		TArray<FString> Words;
++		Argument.ParseIntoArrayWS(Words);
++		FString Message;
++		const bool bOk = Words.Num() > 0 && RunActionJson(ActionJsonFromWords(Words), Message);
++		Say(bOk ? TEXT("Done.") : (Message.IsEmpty() ? TEXT("Usage: /do <action type> key=value ...") : *Message));
++	}
++	else if (Command == TEXT("/clear"))
++	{
++		if (UCPP_UW_IHPCChatPanel* Chat = GetChat())
++		{
++			Chat->ClearMessages();
++		}
++		SessionId = FGuid::NewGuid().ToString(EGuidFormats::Digits).ToLower();   // the server forgets the conversation too
++		CatalogIdSent.Reset();
++	}
++	else
++	{
++		Say(HelpText);   // "/help" and anything else that starts with a slash
++	}
++	return true;
++}
++
++// ---------------------------------------------------------------------------
++// Muscle / bone descriptions (no server involved)
++// ---------------------------------------------------------------------------
++
++void UIHPCAssistantComp::HandlePartSelectionChanged(int32 PartId)
++{
++	// The event does not say which picker it comes from, and one click can produce two events (the new selection,
++	// and another layer's selection being cleared). The reporter is the picker whose selection is PartId and is not
++	// the one we described for it last.
++	UAnatomyPickerComp* Reporter = nullptr;
++	for (const TWeakObjectPtr<UAnatomyPickerComp>& WeakPicker : Pickers)
++	{
++		UAnatomyPickerComp* Picker = WeakPicker.Get();
++		if (!Picker)
++		{
++			continue;
++		}
++		const int32 Selected = Picker->GetSelectedMuscle();
++		int32& Described = LastSelected.FindOrAdd(Picker);
++		if (Selected == 0)
++		{
++			Described = 0;   // cleared: selecting the same part again is news again
++		}
++		else if (!Reporter && PartId > 0 && Selected == PartId && Described != PartId)
++		{
++			Reporter = Picker;
++			Described = PartId;
++		}
++	}
++	if (Reporter && bDescribeClickedParts)
++	{
++		DescribePart(Reporter, PartId);
++	}
++}
++
++void UIHPCAssistantComp::DescribePart(const UAnatomyPickerComp* Picker, int32 PartId)
++{
++	FMuscleInfo Info;
++	if (!Picker || !Picker->GetMuscleInfo(PartId, Info))
++	{
++		return;
++	}
++
++	// The same lines the info popup had, as one chat bubble:
++	//   Biceps brachii (left)
++	//   Upper arm
++	//   What it does: ...
++	//   When running: ...
++	//   Watch out for: ...
++	const FString Side = NormalizeSide(Info.Side.ToString());
++	FString Text = Info.Name.ToString();
++	if (Side != TEXT("center"))
++	{
++		Text += FString::Printf(TEXT(" (%s)"), *Side);
++	}
++	auto AddLine = [&Text](const TCHAR* Label, const FText& Value)
++	{
++		const FString Line = Value.ToString().TrimStartAndEnd();
++		if (!Line.IsEmpty())
++		{
++			Text += FString::Printf(TEXT("\n%s%s"), Label, *Line);
++		}
++	};
++	AddLine(TEXT(""), Info.Region);
++	AddLine(TEXT("What it does: "), Info.Function);
++	AddLine(TEXT("When running: "), Info.Running);
++	AddLine(TEXT("Watch out for: "), Info.Injury);
++
++	Say(Text, bOpenChatForDescriptions);
++}
++
++// ---------------------------------------------------------------------------
++// Server address and key
++// ---------------------------------------------------------------------------
++
++FString UIHPCAssistantComp::GetServerURL() const
++{
++	FString URL;
++	if (!FParse::Value(FCommandLine::Get(), TEXT("AssistantURL="), URL) || URL.IsEmpty())
++	{
++		if (!GConfig || !GConfig->GetString(ConfigSection, TEXT("ServerURL"), URL, GGameUserSettingsIni) || URL.IsEmpty())
++		{
++			URL = ServerURL;
++		}
++	}
++	URL = URL.TrimStartAndEnd();
++	while (URL.EndsWith(TEXT("/")))
++	{
++		URL.LeftChopInline(1);
++	}
++	if (!URL.IsEmpty() && !URL.Contains(TEXT("://")))
++	{
++		URL = TEXT("http://") + URL;   // "spark:8010" is enough
++	}
++	return URL;
++}
++
++void UIHPCAssistantComp::SetServerURL(const FString& NewURL, bool bRemember)
++{
++	const FString Clean = NewURL.TrimStartAndEnd();
++	const bool bReset = Clean.Equals(TEXT("default"), ESearchCase::IgnoreCase) || Clean.Equals(TEXT("reset"), ESearchCase::IgnoreCase);
++	if (bRemember && GConfig)
++	{
++		if (bReset)
++		{
++			GConfig->RemoveKey(ConfigSection, TEXT("ServerURL"), GGameUserSettingsIni);   // back to the project's value
++		}
++		else
++		{
++			GConfig->SetString(ConfigSection, TEXT("ServerURL"), *Clean, GGameUserSettingsIni);
++		}
++		GConfig->Flush(false, GGameUserSettingsIni);
++	}
++	else if (!bReset)
++	{
++		ServerURL = Clean;
++	}
++	CatalogIdSent.Reset();   // a different server has not seen the names
++	UE_LOG(LogIHPCAssistant, Log, TEXT("Server address is now %s"), *GetServerURL());
++}
++
++FString UIHPCAssistantComp::GetApiKey() const
++{
++	FString Key;
++	if (!FParse::Value(FCommandLine::Get(), TEXT("AssistantKey="), Key) || Key.IsEmpty())
++	{
++		if (!GConfig || !GConfig->GetString(ConfigSection, TEXT("ApiKey"), Key, GGameUserSettingsIni) || Key.IsEmpty())
++		{
++			Key = ApiKey;
++		}
++	}
++	return Key.TrimStartAndEnd();
++}
++
++void UIHPCAssistantComp::SetApiKey(const FString& NewKey, bool bRemember)
++{
++	const FString Clean = NewKey.TrimStartAndEnd();
++	if (bRemember && GConfig)
++	{
++		if (Clean.IsEmpty())
++		{
++			GConfig->RemoveKey(ConfigSection, TEXT("ApiKey"), GGameUserSettingsIni);
++		}
++		else
++		{
++			GConfig->SetString(ConfigSection, TEXT("ApiKey"), *Clean, GGameUserSettingsIni);
++		}
++		GConfig->Flush(false, GGameUserSettingsIni);
++	}
++	else
++	{
++		ApiKey = Clean;
++	}
++}
++
++void UIHPCAssistantComp::AddAuthHeader(const TSharedRef<IHttpRequest, ESPMode::ThreadSafe>& HttpRequest) const
++{
++	const FString Key = GetApiKey();
++	if (!Key.IsEmpty())
++	{
++		HttpRequest->SetHeader(TEXT("Authorization"), TEXT("Bearer ") + Key);
++	}
++}
++
++void UIHPCAssistantComp::CheckServer(bool bToChat)
++{
++	const TSharedRef<IHttpRequest, ESPMode::ThreadSafe> HttpRequest = FHttpModule::Get().CreateRequest();
++	HttpRequest->SetURL(GetServerURL() + TEXT("/health"));
++	HttpRequest->SetVerb(TEXT("GET"));
++	HttpRequest->SetTimeout(8.f);
++	HttpRequest->OnProcessRequestComplete().BindUObject(this, &UIHPCAssistantComp::HandleHealthResponse, bToChat);
++	HttpRequest->ProcessRequest();
++}
++
++void UIHPCAssistantComp::HandleHealthResponse(FHttpRequestPtr HttpRequest, FHttpResponsePtr Response, bool bConnected, bool bToChat)
++{
++	FString Text;
++	const TSharedPtr<FJsonObject> Health = (bConnected && Response.IsValid() && Response->GetResponseCode() == 200)
++		? ParseJson(Response->GetContentAsString()) : nullptr;
++	if (Health.IsValid())
++	{
++		FString Llm, Stt;
++		bool bLlmReady = false, bSttReady = false, bAuth = false;
++		Health->TryGetStringField(TEXT("llm_model"), Llm);
++		Health->TryGetStringField(TEXT("stt_model"), Stt);
++		Health->TryGetBoolField(TEXT("llm_ready"), bLlmReady);
++		Health->TryGetBoolField(TEXT("stt_ready"), bSttReady);
++		Health->TryGetBoolField(TEXT("auth_required"), bAuth);
++		Text = FString::Printf(TEXT("The AI server answers. Language model %s: %s. Speech recognition %s: %s.%s"),
++			*Llm, bLlmReady ? TEXT("ready") : TEXT("not ready (direct commands still work)"),
++			*Stt, bSttReady ? TEXT("ready") : TEXT("not ready (typing still works)"),
++			(bAuth && GetApiKey().IsEmpty()) ? TEXT(" It wants a key: set it with /key <text>.") : TEXT(""));
++		UE_LOG(LogIHPCAssistant, Log, TEXT("%s (%s)"), *Text, *GetServerURL());
++	}
++	else
++	{
++		Text = FString::Printf(TEXT("I can't reach the AI server at %s. Clicking a muscle or bone still shows its description. Set the address with /server <address>."), *GetServerURL());
++		UE_LOG(LogIHPCAssistant, Warning, TEXT("AI server not reachable at %s (HTTP %d)"), *GetServerURL(), Response.IsValid() ? Response->GetResponseCode() : 0);
++	}
++	if (bToChat)
++	{
++		Say(Text);
++	}
++}
++
++// ---------------------------------------------------------------------------
++// Requests: one at a time, in the order they were made
++// ---------------------------------------------------------------------------
++
++void UIHPCAssistantComp::Enqueue(FRequest&& Request)
++{
++	Queue.Add(MoveTemp(Request));
++	SetStatus(TEXT("Thinking..."));
++	if (UCPP_UW_IHPCSideBar* SideBar = GetSideBar())
++	{
++		SideBar->SetBotState(EHoloAvatarState::Thinking, RequestTimeout + 2.f);   // the logo thinks until the answer
++	}
++	if (!bRequestInFlight)
++	{
++		SendNext();
++	}
++}
++
++void UIHPCAssistantComp::SendNext()
++{
++	if (bRequestInFlight || Queue.Num() == 0)
++	{
++		return;
++	}
++	Current = MoveTemp(Queue[0]);
++	Queue.RemoveAt(0);
++	bRequestInFlight = true;
++
++	bool bIncludedCatalog = false;
++	const FString Body = BuildRequestBody(Current, bIncludedCatalog);
++	if (bIncludedCatalog)
++	{
++		CatalogIdSent = CatalogId;   // taken back in HandleResponse if the request fails
++	}
++	const FString URL = GetServerURL() + (Current.bVoice ? TEXT("/v1/voice") : TEXT("/v1/chat"));
++
++	const TSharedRef<IHttpRequest, ESPMode::ThreadSafe> HttpRequest = FHttpModule::Get().CreateRequest();
++	HttpRequest->SetURL(URL);
++	HttpRequest->SetVerb(TEXT("POST"));
++	HttpRequest->SetTimeout(RequestTimeout);
++	AddAuthHeader(HttpRequest);
++
++	if (Current.bVoice)
++	{
++		// multipart/form-data: "request" (the JSON) and "audio" (the WAV file).
++		const FString Boundary = TEXT("IHPCAssistant") + FGuid::NewGuid().ToString(EGuidFormats::Digits);
++		TArray<uint8> Payload;
++		AppendUtf8(Payload, FString::Printf(
++			TEXT("--%s\r\nContent-Disposition: form-data; name=\"request\"\r\n\r\n"), *Boundary));
++		AppendUtf8(Payload, Body);
++		AppendUtf8(Payload, FString::Printf(
++			TEXT("\r\n--%s\r\nContent-Disposition: form-data; name=\"audio\"; filename=\"speech.wav\"\r\nContent-Type: audio/wav\r\n\r\n"), *Boundary));
++		Payload.Append(Current.Wav);
++		AppendUtf8(Payload, FString::Printf(TEXT("\r\n--%s--\r\n"), *Boundary));
++		HttpRequest->SetHeader(TEXT("Content-Type"), FString::Printf(TEXT("multipart/form-data; boundary=%s"), *Boundary));
++		HttpRequest->SetContent(MoveTemp(Payload));
++	}
++	else
++	{
++		HttpRequest->SetHeader(TEXT("Content-Type"), TEXT("application/json; charset=utf-8"));
++		HttpRequest->SetContentAsString(Body);
++	}
++
++	UE_LOG(LogIHPCAssistant, Log, TEXT("-> %s %s%s"), *URL,
++		Current.bVoice ? *FString::Printf(TEXT("(%d bytes of audio)"), Current.Wav.Num()) : *FString::Printf(TEXT("\"%s\""), *Current.Text),
++		bIncludedCatalog ? TEXT(" + catalog") : TEXT(""));
++
++	HttpRequest->OnProcessRequestComplete().BindUObject(this, &UIHPCAssistantComp::HandleResponse, ++RequestSerial);
++	HttpRequest->ProcessRequest();
++}
++
++void UIHPCAssistantComp::HandleResponse(FHttpRequestPtr HttpRequest, FHttpResponsePtr Response, bool bConnected, int32 Serial)
++{
++	if (Serial != RequestSerial || !bRequestInFlight)
++	{
++		return;   // an answer to a request that was given up on
++	}
++	const FRequest Request = MoveTemp(Current);
++	Current = FRequest();
++
++	if (!bConnected || !Response.IsValid())
++	{
++		CatalogIdSent.Reset();
++		Queue.Reset();   // no point in sending the rest to a server that is not there
++		Say(FString::Printf(TEXT("I can't reach the AI server at %s. Check the network, or set the address with /server <address>."), *GetServerURL()));
++		FinishRequest();
++		return;
++	}
++
++	const int32 Code = Response->GetResponseCode();
++	const TSharedPtr<FJsonObject> Answer = ParseJson(Response->GetContentAsString());
++	if (Code != 200 || !Answer.IsValid())
++	{
++		CatalogIdSent.Reset();
++		FString Detail;
++		if (Answer.IsValid())
++		{
++			Answer->TryGetStringField(TEXT("detail"), Detail);
++		}
++		UE_LOG(LogIHPCAssistant, Warning, TEXT("AI server: HTTP %d: %s"), Code, *Response->GetContentAsString().Left(500));
++		if (Code == 401 || Code == 403)
++		{
++			Say(TEXT("The AI server did not accept my key. Set it with /key <text>."));
++		}
++		else if (!Detail.IsEmpty())
++		{
++			Say(FString::Printf(TEXT("The AI server could not do that: %s"), *Detail));
++		}
++		else
++		{
++			Say(FString::Printf(TEXT("The AI server answered with an error (%d)."), Code));
++		}
++		FinishRequest();
++		return;
++	}
++
++	ApplyAnswer(Answer, Request);
++	FinishRequest();
++}
++
++void UIHPCAssistantComp::FinishRequest()
++{
++	bRequestInFlight = false;
++	if (Queue.Num() > 0)
++	{
++		SendNext();
++		return;
++	}
++	SetStatus(FString());   // "Thinking..." goes away with the last answer
++}
++
++void UIHPCAssistantComp::ApplyAnswer(const TSharedPtr<FJsonObject>& Answer, const FRequest& Request)
++{
++	FString Transcript, Reply, Source;
++	bool bNeedCatalog = false;
++	double LatencyMs = 0.0;
++	Answer->TryGetStringField(TEXT("transcript"), Transcript);
++	Answer->TryGetStringField(TEXT("reply"), Reply);
++	Answer->TryGetStringField(TEXT("source"), Source);
++	Answer->TryGetBoolField(TEXT("need_catalog"), bNeedCatalog);
++	Answer->TryGetNumberField(TEXT("latency_ms"), LatencyMs);
++	Transcript = Transcript.TrimStartAndEnd();
++	Reply = Reply.TrimStartAndEnd();
++
++	UCPP_UW_IHPCChatPanel* Chat = GetChat();
++	// What was said aloud becomes the user's bubble (typed text already has one).
++	if (Request.bVoice && !Transcript.IsEmpty() && Chat)
++	{
++		Chat->AddUserMessage(FText::FromString(Transcript));
++	}
++
++	// The server does not know this avatar's muscle and bone names: send the same words again, with the names.
++	if (bNeedCatalog && !Request.bCatalogRetry && !CatalogId.IsEmpty())
++	{
++		FRequest Retry;
++		Retry.Text = Transcript.IsEmpty() ? Request.Text : Transcript;   // text, so a voice clip is not uploaded twice
++		Retry.bForceCatalog = true;
++		Retry.bCatalogRetry = true;
++		if (!Retry.Text.IsEmpty())
++		{
++			UE_LOG(LogIHPCAssistant, Log, TEXT("<- the server asked for the catalog; repeating \"%s\" with it"), *Retry.Text);
++			Queue.Insert(MoveTemp(Retry), 0);
++			return;
++		}
++	}
++
++	// Run the actions, in order. Text they produce (descriptions, pose data) is held back until the reply is in the chat.
++	TArray<FIHPCActionResult> Results;
++	const TArray<TSharedPtr<FJsonValue>>* Actions = nullptr;
++	bDeferMessages = true;
++	DeferredMessages.Reset();
++	if (Answer->TryGetArrayField(TEXT("actions"), Actions) && Actions)
++	{
++		for (const TSharedPtr<FJsonValue>& Value : *Actions)
++		{
++			const TSharedPtr<FJsonObject>* ActionObject = nullptr;
++			if (Value.IsValid() && Value->TryGetObject(ActionObject) && ActionObject)
++			{
++				Results.Add(RunAction(*ActionObject));
++			}
++		}
++	}
++	bDeferMessages = false;
++	LastResults = Results;
++
++	// The reply was written as if everything would work. Say what did not.
++	TArray<FString> Failures;
++	for (const FIHPCActionResult& Result : Results)
++	{
++		if (!Result.bOk && !Result.Message.IsEmpty())
++		{
++			Failures.AddUnique(Result.Message);
++		}
++	}
++	FString Text = Reply;
++	if (Failures.Num() > 0)
++	{
++		const bool bAllFailed = Failures.Num() >= Results.Num();
++		Text = (bAllFailed || Reply.IsEmpty()) ? FString::Join(Failures, TEXT(" ")) : Reply + TEXT("\n") + FString::Join(Failures, TEXT(" "));
++	}
++
++	UE_LOG(LogIHPCAssistant, Log, TEXT("<- [%s %.0f ms] heard \"%s\" | %d action(s), %d failed | \"%s\""),
++		*Source, LatencyMs, *Transcript, Results.Num(), Failures.Num(), *Text.Replace(TEXT("\n"), TEXT(" / ")));
++
++	SetStatus(FString());
++	Say(Text, /*bOpenChat*/ true);
++	TArray<FString> Extra = MoveTemp(DeferredMessages);
++	DeferredMessages.Reset();
++	for (const FString& Message : Extra)
++	{
++		Say(Message, true);
++	}
++	if (Text.IsEmpty() && Extra.Num() == 0)
++	{
++		if (UCPP_UW_IHPCSideBar* SideBar = GetSideBar())
++		{
++			SideBar->SetBotState(SideBar->IsChatOpen() ? EHoloAvatarState::Listening : EHoloAvatarState::Idle);
++		}
++	}
++
++	OnAssistantReply.Broadcast(Transcript.IsEmpty() ? Request.Text : Transcript, Text);
++}
++
++bool UIHPCAssistantComp::RunActionJson(const FString& ActionJson, FString& OutMessage)
++{
++	const TSharedPtr<FJsonObject> Action = ParseJson(ActionJson);
++	if (!Action.IsValid())
++	{
++		OutMessage = TEXT("That is not a JSON object.");
++		return false;
++	}
++	const FIHPCActionResult Result = RunAction(Action);
++	OutMessage = Result.Message;
++	return Result.bOk;
++}
++
++// ---------------------------------------------------------------------------
++// Voice: hold the BOT logo
++// ---------------------------------------------------------------------------
++
++bool UIHPCAssistantComp::IsRecording() const
++{
++	return Recorder.IsValid() && Recorder->IsRecording();
++}
++
++void UIHPCAssistantComp::HandleBotVoiceHoldStarted()
++{
++	if (!StartVoice())
++	{
++		if (UCPP_UW_IHPCSideBar* SideBar = GetSideBar())
++		{
++			SideBar->SetBotVoiceActive(false);   // no microphone: the logo goes back to normal
++		}
++	}
++}
++
++void UIHPCAssistantComp::HandleBotVoiceHoldEnded()
++{
++	StopVoiceAndSend();
++}
++
++bool UIHPCAssistantComp::StartVoice()
++{
++	if (IsRecording())
++	{
++		return true;
++	}
++	if (!Recorder.IsValid())
++	{
++		Recorder = MakeShared<FIHPCVoiceRecorder>();
++	}
++	FString Error;
++	if (!Recorder->Start(Error))
++	{
++		UE_LOG(LogIHPCAssistant, Warning, TEXT("Microphone: %s"), *Error);
++		Say(Error, /*bOpenChat*/ true);
++		return false;
++	}
++	RecordStartTime = FPlatformTime::Seconds();
++
++	if (UCPP_UW_IHPCSideBar* SideBar = GetSideBar())
++	{
++		if (!SideBar->IsChatOpen())
++		{
++			SideBar->SetChatOpen(true);   // so "Listening..." and the answer are seen
++		}
++		SideBar->SetBotVoiceActive(true);  // red (already so when the logo is being held)
++	}
++	SetStatus(TEXT("Listening..."));
++	return true;
++}
++
++void UIHPCAssistantComp::CancelVoice()
++{
++	if (Recorder.IsValid())
++	{
++		Recorder->Abort();
++	}
++	if (UCPP_UW_IHPCSideBar* SideBar = GetSideBar())
++	{
++		SideBar->SetBotVoiceActive(false);
++	}
++	if (!IsBusy())
++	{
++		SetStatus(FString());
++	}
++}
++
++void UIHPCAssistantComp::StopVoiceAndSend()
++{
++	if (!IsRecording())
++	{
++		return;
++	}
++	const float Peak = Recorder->GetPeak();
++	float Seconds = 0.f;
++	TArray<uint8> Wav = Recorder->Stop(Seconds);
++	if (UCPP_UW_IHPCSideBar* SideBar = GetSideBar())
++	{
++		SideBar->SetBotVoiceActive(false);
++	}
++	if (!IsBusy())
++	{
++		SetStatus(FString());
++	}
++	UE_LOG(LogIHPCAssistant, Log, TEXT("Microphone: %.2f s recorded, %d bytes, loudest sample %.3f"), Seconds, Wav.Num(), Peak);
++
++	if (Seconds < MinRecordSeconds || Wav.Num() <= 44)
++	{
++		Say(TEXT("Keep my logo held while you speak, then let go."), true);
++		return;
++	}
++	if (Peak < 0.0005f)
++	{
++		Say(TEXT("The microphone gave only silence. Check that it is not muted and that this app may use it (on a Mac: System Settings, Privacy & Security, Microphone)."), true);
++		return;
++	}
++
++	FRequest Request;
++	Request.bVoice = true;
++	Request.Wav = MoveTemp(Wav);
++	Enqueue(MoveTemp(Request));
++}
++
++bool UIHPCAssistantComp::SendWavFile(const FString& FilePath)
++{
++	FRequest Request;
++	Request.bVoice = true;
++	if (!FFileHelper::LoadFileToArray(Request.Wav, *FilePath) || Request.Wav.Num() <= 44)
++	{
++		UE_LOG(LogIHPCAssistant, Warning, TEXT("SendWavFile: could not read %s"), *FilePath);
++		return false;
++	}
++	if (UCPP_UW_IHPCSideBar* SideBar = GetSideBar())
++	{
++		if (!SideBar->IsChatOpen())
++		{
++			SideBar->SetChatOpen(true);
++		}
++	}
++	Enqueue(MoveTemp(Request));
++	return true;
++}
++
++// ---------------------------------------------------------------------------
++// Console commands
++// ---------------------------------------------------------------------------
++
++namespace
++{
++	UIHPCAssistantComp* FindAssistant(UWorld* World)
++	{
++		const APlayerController* Controller = World ? World->GetFirstPlayerController() : nullptr;
++		return Controller ? Controller->FindComponentByClass<UIHPCAssistantComp>() : nullptr;
++	}
++
++	FAutoConsoleCommandWithWorldAndArgs AskCommand(
++		TEXT("Assistant.Ask"),
++		TEXT("Assistant.Ask <text>: the same as typing <text> in the BOT chat box."),
++		FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>& Args, UWorld* World)
++		{
++			if (UIHPCAssistantComp* Assistant = FindAssistant(World))
++			{
++				Assistant->Ask(FString::Join(Args, TEXT(" ")));
++			}
++		}));
++
++	FAutoConsoleCommandWithWorldAndArgs DoCommand(
++		TEXT("Assistant.Do"),
++		TEXT("Assistant.Do <type> [key=value ...]: run one assistant action without the AI server, e.g. ")
++		TEXT("\"Assistant.Do set_layer layer=muscles\", \"Assistant.Do show_part kind=muscle name=Biceps_brachii side=left\" ")
++		TEXT("(an underscore in a name is a space)."),
++		FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>& Args, UWorld* World)
++		{
++			if (UIHPCAssistantComp* Assistant = FindAssistant(World))
++			{
++				FString Message;
++				const FString Joined = FString::Join(Args, TEXT(" "));
++				// Real JSON works when it survives the console (no quotes needed inside: keys and values without spaces).
++				const bool bOk = Assistant->RunActionJson(Joined.StartsWith(TEXT("{")) && Joined.Contains(TEXT("\"")) ? Joined : ActionJsonFromWords(Args), Message);
++				UE_LOG(LogIHPCAssistant, Display, TEXT("Assistant.Do: %s%s%s"), bOk ? TEXT("ok") : TEXT("failed"), Message.IsEmpty() ? TEXT("") : TEXT(": "), *Message);
++			}
++		}));
++
++	FAutoConsoleCommandWithWorldAndArgs ServerCommand(
++		TEXT("Assistant.Server"),
++		TEXT("Assistant.Server [host:port]: show, or change and remember, the AI server address (without http://: the console ")
++		TEXT("cuts everything after \"//\"). \"default\" = the project's value."),
++		FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>& Args, UWorld* World)
++		{
++			if (UIHPCAssistantComp* Assistant = FindAssistant(World))
++			{
++				// The console reads "//" as the start of a comment, so "http://spark:8010" arrives as "http:".
++				if (Args.Num() > 0 && (Args[0].Equals(TEXT("http:"), ESearchCase::IgnoreCase) || Args[0].Equals(TEXT("https:"), ESearchCase::IgnoreCase)))
++				{
++					UE_LOG(LogIHPCAssistant, Warning, TEXT("The console cuts everything after \"//\". Give the address without http://, e.g. Assistant.Server spark:8010 (or use /server in the chat box)."));
++					return;
++				}
++				if (Args.Num() > 0)
++				{
++					Assistant->SetServerURL(Args[0], true);
++				}
++				UE_LOG(LogIHPCAssistant, Display, TEXT("AI server: %s"), *Assistant->GetServerURL());
++			}
++		}));
++
++	FAutoConsoleCommandWithWorldAndArgs KeyCommand(
++		TEXT("Assistant.Key"),
++		TEXT("Assistant.Key [text]: change and remember the key sent to the AI server. \"none\" = no key."),
++		FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>& Args, UWorld* World)
++		{
++			if (UIHPCAssistantComp* Assistant = FindAssistant(World))
++			{
++				if (Args.Num() > 0)
++				{
++					Assistant->SetApiKey(Args[0].Equals(TEXT("none"), ESearchCase::IgnoreCase) ? FString() : Args[0], true);
++				}
++				UE_LOG(LogIHPCAssistant, Display, TEXT("AI server key: changed with Assistant.Key <text>"));
++			}
++		}));
++
++	FAutoConsoleCommandWithWorldAndArgs StatusCommand(
++		TEXT("Assistant.Status"),
++		TEXT("Assistant.Status: ask the AI server for its /health (the answer goes to the chat box and the log)."),
++		FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>& Args, UWorld* World)
++		{
++			if (UIHPCAssistantComp* Assistant = FindAssistant(World))
++			{
++				Assistant->CheckServer(true);
++			}
++		}));
++
++	FAutoConsoleCommandWithWorldAndArgs TalkCommand(
++		TEXT("Assistant.Talk"),
++		TEXT("Assistant.Talk 1 | 0: start / stop-and-send a microphone recording (the same as holding the BOT logo)."),
++		FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>& Args, UWorld* World)
++		{
++			if (UIHPCAssistantComp* Assistant = FindAssistant(World))
++			{
++				const bool bStart = Args.Num() > 0 ? Args[0].ToBool() : !Assistant->IsRecording();
++				bStart ? (void)Assistant->StartVoice() : Assistant->StopVoiceAndSend();
++			}
++		}));
++
++	FAutoConsoleCommandWithWorldAndArgs HoldLogoCommand(
++		TEXT("Assistant.HoldLogo"),
++		TEXT("Assistant.HoldLogo [seconds]: TEST - press the BOT logo, hold it (default 2 s) and let go, through Slate's own pointer events."),
++		FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>& Args, UWorld* World)
++		{
++			const ACPP_PlayerController* Controller = World ? Cast<ACPP_PlayerController>(World->GetFirstPlayerController()) : nullptr;
++			UCPP_UW_IHPCHud* HudWidget = Controller ? Controller->GetMainHUD() : nullptr;
++			if (UCPP_UW_IHPCSideBar* SideBar = HudWidget ? HudWidget->GetSideBar() : nullptr)
++			{
++				SideBar->SimulateBotHold(Args.Num() > 0 ? FCString::Atof(*Args[0]) : 2.f);
++			}
++		}));
++
++	FAutoConsoleCommandWithWorldAndArgs SendWavCommand(
++		TEXT("Assistant.SendWav"),
++		TEXT("Assistant.SendWav <file.wav>: send a recording from disk to the AI server as if it had been spoken."),
++		FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>& Args, UWorld* World)
++		{
++			if (UIHPCAssistantComp* Assistant = FindAssistant(World))
++			{
++				Assistant->SendWavFile(FString::Join(Args, TEXT(" ")));
++			}
++		}));
++}
+diff --git a/Source/MetaHumanTest/Private/Assistant/IHPCAssistantContext.cpp b/Source/MetaHumanTest/Private/Assistant/IHPCAssistantContext.cpp
+new file mode 100644
+index 0000000..2757865
+--- /dev/null
++++ b/Source/MetaHumanTest/Private/Assistant/IHPCAssistantContext.cpp
+@@ -0,0 +1,362 @@
++// IHPCAssistantContext.cpp - what the assistant sends with every request: the avatar's state ("context") and the
++// names of its muscles and bones ("catalog"). Field names and values are fixed by docs/PROTOCOL.md.
++
++#include "Assistant/IHPCAssistantComp.h"
++
++#include "../../CPP_MouseFunctionComp.h"    // module root (not on the include path)
++#include "../../CPP_PlayerController.h"
++#include "AnatomyPickerComp.h"
++#include "AnimationTimelineComp.h"
++#include "IHPC_UI/CPP_UW_IHPCActionsPanel.h"
++#include "IHPC_UI/CPP_UW_IHPCHud.h"
++#include "IHPC_UI/CPP_UW_IHPCLayerSwitcher.h"
++#include "IHPC_UI/CPP_UW_IHPCSideBar.h"
++#include "IHPC_UI/CPP_UW_IHPCTimeline.h"
++#include "IHPC_UI/IHPCUILibrary.h"
++#include "MuscleAtlas.h"
++#include "PoseEstimation/PoseEstimationComp.h"
++
++#include "Dom/JsonObject.h"
++#include "Dom/JsonValue.h"
++#include "GameFramework/Pawn.h"
++#include "Misc/SecureHash.h"
++#include "Serialization/JsonSerializer.h"
++#include "Serialization/JsonWriter.h"
++
++namespace
++{
++	const TCHAR* LayerName(EIHPCAnatomyLayer Layer)
++	{
++		switch (Layer)
++		{
++		case EIHPCAnatomyLayer::Muscles:  return TEXT("muscles");
++		case EIHPCAnatomyLayer::Skeleton: return TEXT("skeleton");
++		default:                          return TEXT("body");
++		}
++	}
++
++	const TCHAR* PanelName(EIHPCSideTab Tab)
++	{
++		switch (Tab)
++		{
++		case EIHPCSideTab::Actions:        return TEXT("actions");
++		case EIHPCSideTab::PoseEstimation: return TEXT("pose_estimation");
++		case EIHPCSideTab::Graphs:         return TEXT("graphs");
++		case EIHPCSideTab::Timeline:       return TEXT("timeline");
++		case EIHPCSideTab::SavedVideos:    return TEXT("saved_videos");
++		case EIHPCSideTab::Settings:       return TEXT("settings");
++		default:                           return TEXT("none");
++		}
++	}
++
++	const TCHAR* VisibleSideName(EPoseVisibleSide Side)
++	{
++		switch (Side)
++		{
++		case EPoseVisibleSide::Right: return TEXT("right");
++		case EPoseVisibleSide::Left:  return TEXT("left");
++		case EPoseVisibleSide::Front: return TEXT("front");
++		case EPoseVisibleSide::Back:  return TEXT("back");
++		default:                      return TEXT("");
++		}
++	}
++
++	/** Two decimals are plenty for the server and keep the request short. */
++	double Round2(double Value)
++	{
++		return FMath::RoundToDouble(Value * 100.0) / 100.0;
++	}
++
++	FString ToJsonString(const TSharedRef<FJsonObject>& Object)
++	{
++		FString Out;
++		const TSharedRef<TJsonWriter<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>> Writer =
++			TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&Out);
++		FJsonSerializer::Serialize(Object, Writer);
++		return Out;
++	}
++}
++
++FString UIHPCAssistantComp::NormalizeName(const FString& Name)
++{
++	// "Biceps femoris (long head)" and "biceps femoris long head" are the same name.
++	FString Out;
++	Out.Reserve(Name.Len());
++	for (const TCHAR Char : Name)
++	{
++		if (FChar::IsAlnum(Char))
++		{
++			Out.AppendChar(FChar::ToLower(Char));
++		}
++	}
++	return Out;
++}
++
++FString UIHPCAssistantComp::NormalizeSide(const FString& Side)
++{
++	const FString Lower = Side.TrimStartAndEnd().ToLower();
++	if (Lower.StartsWith(TEXT("l")))
++	{
++		return TEXT("left");
++	}
++	if (Lower.StartsWith(TEXT("r")))
++	{
++		return TEXT("right");
++	}
++	return TEXT("center");   // "Centre", "Center", "" (the atlases use Centre for the spine, skull ...)
++}
++
++// ---------------------------------------------------------------------------
++// Catalog: the names the avatar knows
++// ---------------------------------------------------------------------------
++
++void UIHPCAssistantComp::RebuildCatalog()
++{
++	Parts.Reset();
++
++	for (const TWeakObjectPtr<UAnatomyPickerComp>& WeakPicker : Pickers)
++	{
++		const UAnatomyPickerComp* Picker = WeakPicker.Get();
++		const UMuscleAtlas* Atlas = Picker ? Picker->GetAtlas() : nullptr;
++		if (!Atlas)
++		{
++			continue;
++		}
++		// A picker works on one anatomy layer; the layer says whether its parts are muscles or bones.
++		const FString Layer = Picker->RequiredLayerName.ToString();
++		const bool bBones = Layer.Contains(TEXT("Skel")) || Layer.Contains(TEXT("Bone"));
++
++		for (const FMuscleInfo& Info : Atlas->Muscles)
++		{
++			FIHPCPartRef Part;
++			Part.Picker = const_cast<UAnatomyPickerComp*>(Picker);
++			Part.Id = Info.Id;
++			Part.Kind = bBones ? TEXT("bone") : TEXT("muscle");
++			Part.Name = Info.Name.ToString().TrimStartAndEnd();
++			Part.Side = NormalizeSide(Info.Side.ToString());
++			Part.Region = Info.Region.ToString();
++			Part.Key = NormalizeName(Part.Name);
++			if (Part.Id > 0 && !Part.Key.IsEmpty())
++			{
++				Parts.Add(MoveTemp(Part));
++			}
++		}
++	}
++
++	// One catalog entry per kind + name, with the sides it exists on.
++	TArray<TSharedPtr<FJsonValue>> Entries;
++	TMap<FString, TSharedPtr<FJsonObject>> ByName;
++	static const TCHAR* SideOrder[] = { TEXT("left"), TEXT("right"), TEXT("center") };
++	for (const FIHPCPartRef& Part : Parts)
++	{
++		const FString EntryKey = Part.Kind + TEXT(":") + Part.Key;
++		if (!ByName.Contains(EntryKey))
++		{
++			TSharedPtr<FJsonObject> Entry = MakeShared<FJsonObject>();
++			Entry->SetStringField(TEXT("kind"), Part.Kind);
++			Entry->SetStringField(TEXT("name"), Part.Name);
++			TArray<TSharedPtr<FJsonValue>> Sides;
++			for (const TCHAR* Side : SideOrder)
++			{
++				const bool bHasSide = Parts.ContainsByPredicate([&](const FIHPCPartRef& Other)
++					{ return Other.Kind == Part.Kind && Other.Key == Part.Key && Other.Side == Side; });
++				if (bHasSide)
++				{
++					Sides.Add(MakeShared<FJsonValueString>(Side));
++				}
++			}
++			Entry->SetArrayField(TEXT("sides"), Sides);
++			Entry->SetStringField(TEXT("region"), Part.Region);
++			ByName.Add(EntryKey, Entry);
++			Entries.Add(MakeShared<FJsonValueObject>(Entry));
++		}
++	}
++
++	const TSharedRef<FJsonObject> Catalog = MakeShared<FJsonObject>();
++	Catalog->SetArrayField(TEXT("parts"), Entries);
++	CatalogJson = ToJsonString(Catalog);
++	// The id only has to change when the names change: a hash of the text.
++	CatalogId = Entries.Num() > 0 ? FMD5::HashAnsiString(*CatalogJson).Left(12) : FString();
++
++	UE_LOG(LogIHPCAssistant, Log, TEXT("Catalog %s: %d names (%d muscle / bone entries) from %d picker(s) on %s"),
++		CatalogId.IsEmpty() ? TEXT("(empty)") : *CatalogId, Entries.Num(), Parts.Num(), Pickers.Num(), *GetNameSafe(GetAvatar()));
++}
++
++// ---------------------------------------------------------------------------
++// Context: the avatar's state right now
++// ---------------------------------------------------------------------------
++
++TSharedRef<FJsonObject> UIHPCAssistantComp::BuildContext() const
++{
++	const TSharedRef<FJsonObject> Context = MakeShared<FJsonObject>();
++	const ACPP_PlayerController* Controller = Cast<ACPP_PlayerController>(GetOwner());
++	const APawn* Avatar = GetAvatar();
++	const UCPP_UW_IHPCHud* HudWidget = GetHud();
++
++	// ---- avatar
++	if (Avatar)
++	{
++		const TSharedRef<FJsonObject> AvatarJson = MakeShared<FJsonObject>();
++		FString Name = Avatar->GetClass()->GetName();
++		Name.RemoveFromEnd(TEXT("_C"));   // Blueprint classes are called BP_Abby8_C
++		AvatarJson->SetStringField(TEXT("name"), Name);
++		if (Controller)
++		{
++			AvatarJson->SetNumberField(TEXT("index"), Controller->GetCurrentPawnIndex());
++			AvatarJson->SetNumberField(TEXT("count"), Controller->SwitchablePawnClasses.Num());
++		}
++		Context->SetObjectField(TEXT("avatar"), AvatarJson);
++	}
++
++	// ---- layer (only for an avatar that has anatomy layers)
++	const UCPP_UW_IHPCLayerSwitcher* Layers = HudWidget ? HudWidget->GetLayerSwitcher() : nullptr;
++	if (Layers && Layers->CanDriveAvatarLayers())
++	{
++		Context->SetStringField(TEXT("layer"), LayerName(Layers->GetSelectedLayer()));
++	}
++
++	// ---- timeline
++	if (const UAnimationTimelineComp* Animation = UIHPCUILibrary::FindAvatarTimeline(this))
++	{
++		const TSharedRef<FJsonObject> TimelineJson = MakeShared<FJsonObject>();
++		TimelineJson->SetBoolField(TEXT("playing"), Animation->IsPlaying());
++		TimelineJson->SetNumberField(TEXT("speed"), Round2(Animation->PlaySpeed));
++		TimelineJson->SetNumberField(TEXT("time"), Round2(Animation->GetNormalizedTime()));
++		TimelineJson->SetNumberField(TEXT("cycle_seconds"), Round2(Animation->GetCycleLength()));
++		if (const UCPP_UW_IHPCTimeline* Bar = HudWidget ? HudWidget->GetTimeline() : nullptr)
++		{
++			TArray<TSharedPtr<FJsonValue>> Steps;
++			for (const float Step : Bar->SpeedSteps)
++			{
++				Steps.Add(MakeShared<FJsonValueNumber>(Step));
++			}
++			TimelineJson->SetArrayField(TEXT("speed_steps"), Steps);
++			TimelineJson->SetBoolField(TEXT("recording"), Bar->IsRecording());
++		}
++		Context->SetObjectField(TEXT("timeline"), TimelineJson);
++	}
++
++	// ---- action clips
++	if (const UCPP_UW_IHPCActionsPanel* Actions = HudWidget ? HudWidget->GetActionsPanel() : nullptr)
++	{
++		const TSharedRef<FJsonObject> ActionJson = MakeShared<FJsonObject>();
++		// "" = the avatar's own animation (the Idle card).
++		const FName Highlighted = Actions->GetHighlightedAction();
++		const bool bIsIdleCard = Actions->Actions.ContainsByPredicate([Highlighted](const FIHPCActionInfo& Info)
++			{ return Info.bIsDefault && Info.ActionName == Highlighted; });
++		ActionJson->SetStringField(TEXT("playing"), (Highlighted.IsNone() || bIsIdleCard) ? FString() : Highlighted.ToString());
++		TArray<TSharedPtr<FJsonValue>> Available;
++		for (const FName& Name : Actions->GetAvailableActions())
++		{
++			Available.Add(MakeShared<FJsonValueString>(Name.ToString()));
++		}
++		ActionJson->SetArrayField(TEXT("available"), Available);
++		Context->SetObjectField(TEXT("action"), ActionJson);
++	}
++
++	// ---- side panel, chat
++	if (HudWidget)
++	{
++		Context->SetStringField(TEXT("panel"), PanelName(HudWidget->GetSelectedSideTab()));
++		if (const UCPP_UW_IHPCSideBar* SideBar = HudWidget->GetSideBar())
++		{
++			Context->SetBoolField(TEXT("chat_open"), SideBar->IsChatOpen());
++		}
++	}
++
++	// ---- camera
++	if (const UCPP_MouseFunctionComp* Camera = GetCamera())
++	{
++		const TSharedRef<FJsonObject> CameraJson = MakeShared<FJsonObject>();
++		CameraJson->SetNumberField(TEXT("distance"), Round2(Camera->GetTargetCameraDistance()));
++		CameraJson->SetNumberField(TEXT("min"), Camera->MinZoom);
++		CameraJson->SetNumberField(TEXT("max"), Camera->MaxZoom);
++		CameraJson->SetBoolField(TEXT("moved"), Camera->IsViewChanged());
++		Context->SetObjectField(TEXT("camera"), CameraJson);
++	}
++
++	// ---- pose estimation
++	if (const UPoseEstimationComp* Pose = Controller ? Controller->GetPoseEstimation() : nullptr)
++	{
++		const TSharedRef<FJsonObject> PoseJson = MakeShared<FJsonObject>();
++		static const TCHAR* StatusNames[] = { TEXT("off"), TEXT("loading"), TEXT("running"), TEXT("error") };
++		PoseJson->SetStringField(TEXT("status"), StatusNames[FMath::Clamp(static_cast<int32>(Pose->GetStatus()), 0, 3)]);
++		PoseJson->SetBoolField(TEXT("overlay"), Pose->IsEstimationEnabled() && Pose->IsOverlayVisible());
++		PoseJson->SetBoolField(TEXT("panel_open"), Pose->IsDataPanelOpen());
++		PoseJson->SetBoolField(TEXT("recording"), Pose->IsRecording());
++		PoseJson->SetNumberField(TEXT("fps"), Round2(Pose->GetAnalysesPerSecond()));
++
++		// The numbers only mean something while frames are being analysed.
++		const FPosePerson* Person = HasFreshPose() ? Pose->GetLatestResult().GetPrimary() : nullptr;
++		PoseJson->SetBoolField(TEXT("person"), Person != nullptr);
++		if (Person)
++		{
++			PoseJson->SetStringField(TEXT("visible_side"), VisibleSideName(Person->VisibleSide));
++			const TSharedRef<FJsonObject> AnglesJson = MakeShared<FJsonObject>();
++			for (const FPoseAngle& Angle : Person->Angles)
++			{
++				if (Angle.bValid)
++				{
++					AnglesJson->SetNumberField(Angle.Name.ToString(), FMath::RoundToDouble(Angle.Degrees * 10.0) / 10.0);
++				}
++			}
++			PoseJson->SetObjectField(TEXT("angles"), AnglesJson);
++		}
++		Context->SetObjectField(TEXT("pose"), PoseJson);
++	}
++
++	// ---- the highlighted muscle / bone
++	for (const FIHPCPartRef& Part : Parts)
++	{
++		const UAnatomyPickerComp* Picker = Part.Picker.Get();
++		if (Picker && Picker->GetSelectedMuscle() == Part.Id)
++		{
++			const TSharedRef<FJsonObject> PartJson = MakeShared<FJsonObject>();
++			PartJson->SetStringField(TEXT("kind"), Part.Kind);
++			PartJson->SetStringField(TEXT("name"), Part.Name);
++			PartJson->SetStringField(TEXT("side"), Part.Side);
++			Context->SetObjectField(TEXT("selected_part"), PartJson);
++			break;
++		}
++	}
++
++	// ---- what the last answer's actions did
++	TArray<TSharedPtr<FJsonValue>> Results;
++	for (const FIHPCActionResult& Result : LastResults)
++	{
++		const TSharedRef<FJsonObject> ResultJson = MakeShared<FJsonObject>();
++		ResultJson->SetStringField(TEXT("type"), Result.Type);
++		ResultJson->SetBoolField(TEXT("ok"), Result.bOk);
++		ResultJson->SetStringField(TEXT("message"), Result.Message);
++		Results.Add(MakeShared<FJsonValueObject>(ResultJson));
++	}
++	Context->SetArrayField(TEXT("last_results"), Results);
++
++	return Context;
++}
++
++FString UIHPCAssistantComp::BuildRequestBody(const FRequest& Request, bool& bOutIncludedCatalog) const
++{
++	const TSharedRef<FJsonObject> Body = MakeShared<FJsonObject>();
++	Body->SetNumberField(TEXT("protocol"), 1);
++	Body->SetStringField(TEXT("session_id"), SessionId);
++	if (!Request.bVoice)
++	{
++		Body->SetStringField(TEXT("text"), Request.Text);
++	}
++	Body->SetObjectField(TEXT("context"), BuildContext());
++	Body->SetStringField(TEXT("catalog_id"), CatalogId);
++
++	// The names go along the first time (new session, or a different avatar) and whenever the server asks.
++	bOutIncludedCatalog = !CatalogId.IsEmpty() && (Request.bForceCatalog || CatalogIdSent != CatalogId);
++	if (bOutIncludedCatalog)
++	{
++		TSharedPtr<FJsonObject> Catalog;
++		const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(CatalogJson);
++		if (FJsonSerializer::Deserialize(Reader, Catalog) && Catalog.IsValid())
++		{
++			Body->SetObjectField(TEXT("catalog"), Catalog);
++		}
++	}
++	return ToJsonString(Body);
++}
+diff --git a/Source/MetaHumanTest/Private/Assistant/IHPCAssistantVoice.cpp b/Source/MetaHumanTest/Private/Assistant/IHPCAssistantVoice.cpp
+new file mode 100644
+index 0000000..711e30d
+--- /dev/null
++++ b/Source/MetaHumanTest/Private/Assistant/IHPCAssistantVoice.cpp
+@@ -0,0 +1,175 @@
++// IHPCAssistantVoice.cpp - microphone -> WAV for the assistant's push-to-talk. See the header.
++
++#include "IHPCAssistantVoice.h"
++
++#include "AudioCaptureCore.h"
++#include "Modules/ModuleManager.h"
++
++FIHPCVoiceRecorder::FIHPCVoiceRecorder() = default;
++
++FIHPCVoiceRecorder::~FIHPCVoiceRecorder()
++{
++	Abort();
++}
++
++bool FIHPCVoiceRecorder::Start(FString& OutError)
++{
++	if (bRecording)
++	{
++		return true;
++	}
++
++	// The platform's capture code lives in the Audio Capture plugin; without it there is no stream to open.
++	if (!FModuleManager::Get().IsModuleLoaded(TEXT("AudioCapture")))
++	{
++		FModuleManager::Get().LoadModule(TEXT("AudioCapture"));
++	}
++
++	if (!Synth.IsValid())
++	{
++		Synth = MakeUnique<Audio::FAudioCaptureSynth>();
++	}
++
++	// The stream is opened for every recording and closed after it, so a microphone that was plugged in or
++	// chosen as the system default in between is picked up.
++	if (!Synth->IsStreamOpen())
++	{
++		Audio::FCaptureDeviceInfo Device;
++		if (!Synth->GetDefaultCaptureDeviceInfo(Device) || Device.InputChannels <= 0 || Device.PreferredSampleRate <= 0)
++		{
++			OutError = TEXT("I can't find a microphone. Check the system's default input device.");
++			return false;
++		}
++		// Without the real channel count and sample rate the WAV would play at the wrong speed.
++		Channels = Device.InputChannels;
++		SampleRate = Device.PreferredSampleRate;
++
++		if (!Synth->OpenDefaultStream())
++		{
++			OutError = TEXT("I couldn't open the microphone. Allow microphone access for this app in the system settings.");
++			return false;
++		}
++	}
++
++	Samples.Reset();
++	Peak = 0.f;
++	if (!Synth->StartCapturing())
++	{
++		Synth->AbortCapturing();
++		OutError = TEXT("The microphone did not start.");
++		return false;
++	}
++	bRecording = true;
++	return true;
++}
++
++float FIHPCVoiceRecorder::Poll()
++{
++	if (!bRecording || !Synth.IsValid())
++	{
++		return 0.f;
++	}
++	TArray<float> Fresh;
++	if (!Synth->GetAudioData(Fresh) || Fresh.Num() == 0)
++	{
++		return 0.f;
++	}
++	Samples.Append(Fresh);
++
++	// Loudness of this piece: root mean square, scaled so normal speech lands around 0.3 - 0.8.
++	double SumSquares = 0.0;
++	for (const float Sample : Fresh)
++	{
++		SumSquares += static_cast<double>(Sample) * Sample;
++		Peak = FMath::Max(Peak, FMath::Abs(Sample));
++	}
++	const float Rms = FMath::Sqrt(static_cast<float>(SumSquares / Fresh.Num()));
++	return FMath::Clamp(Rms * 6.f, 0.f, 1.f);
++}
++
++TArray<uint8> FIHPCVoiceRecorder::Stop(float& OutSeconds)
++{
++	OutSeconds = 0.f;
++	if (!bRecording)
++	{
++		return TArray<uint8>();
++	}
++	Poll();   // whatever arrived since the last poll
++	bRecording = false;
++	if (Synth.IsValid() && Synth->IsStreamOpen())
++	{
++		Synth->AbortCapturing();   // stops and closes the stream
++	}
++
++	OutSeconds = GetSeconds();
++	TArray<uint8> Wav = Samples.Num() > 0 ? BuildWav(Samples, Channels, SampleRate) : TArray<uint8>();
++	Samples.Reset();
++	return Wav;
++}
++
++void FIHPCVoiceRecorder::Abort()
++{
++	bRecording = false;
++	if (Synth.IsValid() && Synth->IsStreamOpen())
++	{
++		Synth->AbortCapturing();
++	}
++	Samples.Reset();
++}
++
++float FIHPCVoiceRecorder::GetSeconds() const
++{
++	const int32 SamplesPerSecond = FMath::Max(1, Channels) * FMath::Max(1, SampleRate);
++	return static_cast<float>(Samples.Num()) / SamplesPerSecond;
++}
++
++TArray<uint8> FIHPCVoiceRecorder::BuildWav(const TArray<float>& InSamples, int32 NumChannels, int32 InSampleRate)
++{
++	NumChannels = FMath::Max(1, NumChannels);
++	const int32 NumFrames = InSamples.Num() / NumChannels;
++
++	// Mix down to mono: speech recognition needs no more, and the upload is smaller.
++	TArray<float> Mono;
++	Mono.SetNumUninitialized(NumFrames);
++	float Peak = 0.f;
++	for (int32 Frame = 0; Frame < NumFrames; ++Frame)
++	{
++		float Sum = 0.f;
++		for (int32 Channel = 0; Channel < NumChannels; ++Channel)
++		{
++			Sum += InSamples[Frame * NumChannels + Channel];
++		}
++		Mono[Frame] = Sum / NumChannels;
++		Peak = FMath::Max(Peak, FMath::Abs(Mono[Frame]));
++	}
++
++	// Laptop and headset microphones are often very quiet: bring the loudest sample up to 0.9, at most 8 x.
++	const float Gain = (Peak > 0.001f && Peak < 0.5f) ? FMath::Min(0.9f / Peak, 8.f) : 1.f;
++
++	const uint32 DataBytes = static_cast<uint32>(NumFrames) * 2u;
++	TArray<uint8> Wav;
++	Wav.Reserve(44 + DataBytes);
++	auto WriteTag = [&Wav](const char* Tag) { Wav.Append(reinterpret_cast<const uint8*>(Tag), 4); };
++	auto Write32 = [&Wav](uint32 Value) { Wav.Append(reinterpret_cast<const uint8*>(&Value), 4); };
++	auto Write16 = [&Wav](uint16 Value) { Wav.Append(reinterpret_cast<const uint8*>(&Value), 2); };
++
++	WriteTag("RIFF");
++	Write32(36 + DataBytes);
++	WriteTag("WAVE");
++	WriteTag("fmt ");
++	Write32(16);                                         // size of the fmt chunk
++	Write16(1);                                          // PCM
++	Write16(1);                                          // mono
++	Write32(static_cast<uint32>(InSampleRate));
++	Write32(static_cast<uint32>(InSampleRate) * 2u);     // bytes per second
++	Write16(2);                                          // bytes per frame
++	Write16(16);                                         // bits per sample
++	WriteTag("data");
++	Write32(DataBytes);
++	for (int32 Frame = 0; Frame < NumFrames; ++Frame)
++	{
++		const float Value = FMath::Clamp(Mono[Frame] * Gain, -1.f, 1.f);
++		Write16(static_cast<uint16>(static_cast<int16>(Value * 32767.f)));
++	}
++	return Wav;
++}
+diff --git a/Source/MetaHumanTest/Private/Assistant/IHPCAssistantVoice.h b/Source/MetaHumanTest/Private/Assistant/IHPCAssistantVoice.h
+new file mode 100644
+index 0000000..e9ccd99
+--- /dev/null
++++ b/Source/MetaHumanTest/Private/Assistant/IHPCAssistantVoice.h
+@@ -0,0 +1,54 @@
++// IHPCAssistantVoice.h - the microphone for the assistant's push-to-talk (hold the BOT logo).
++// Records the default input device while the logo is held and hands back one 16-bit mono WAV file, which
++// UIHPCAssistantComp uploads to the AI server (POST /v1/voice). Needs the engine's Audio Capture plugin.
++
++#pragma once
++
++#include "CoreMinimal.h"
++
++namespace Audio
++{
++	class FAudioCaptureSynth;
++}
++
++class FIHPCVoiceRecorder
++{
++public:
++	FIHPCVoiceRecorder();
++	~FIHPCVoiceRecorder();
++
++	/** Opens the default microphone and starts recording. False (with a sentence for the user in OutError) if there
++	 *  is no microphone, the Audio Capture plugin is off, or the system did not allow access. */
++	bool Start(FString& OutError);
++
++	/** Call a few times per second while recording: moves what the microphone captured into the recording.
++	 *  Returns the loudness of the newest piece, 0..1 (for the BOT logo's ripples). */
++	float Poll();
++
++	/** Stops and returns the recording as a WAV file (16-bit PCM, mono, the microphone's sample rate).
++	 *  OutSeconds = its length. An empty array if nothing was captured. */
++	TArray<uint8> Stop(float& OutSeconds);
++
++	/** Stops and throws the recording away. */
++	void Abort();
++
++	bool IsRecording() const { return bRecording; }
++
++	/** Seconds recorded so far. */
++	float GetSeconds() const;
++
++	/** The loudest sample of the recording so far, 0..1. About 0 = the microphone gave only silence (muted, or the
++	 *  system did not allow this app to use it). */
++	float GetPeak() const { return Peak; }
++
++	/** 16-bit mono PCM WAV from interleaved float samples. Quiet recordings are made louder (up to 8 x). */
++	static TArray<uint8> BuildWav(const TArray<float>& Samples, int32 NumChannels, int32 SampleRate);
++
++private:
++	TUniquePtr<Audio::FAudioCaptureSynth> Synth;
++	TArray<float> Samples;      // interleaved, Channels per frame
++	int32 Channels = 1;
++	int32 SampleRate = 48000;
++	float Peak = 0.f;
++	bool bRecording = false;
++};
+diff --git a/Source/MetaHumanTest/Private/CPP_UW_MuscleInfo.cpp b/Source/MetaHumanTest/Private/CPP_UW_MuscleInfo.cpp
+index e9f9f8d..8afb0ca 100644
+--- a/Source/MetaHumanTest/Private/CPP_UW_MuscleInfo.cpp
++++ b/Source/MetaHumanTest/Private/CPP_UW_MuscleInfo.cpp
+@@ -165,7 +165,8 @@ void UCPP_UW_MuscleInfo::HandleSelectionChanged(int32 MuscleId)
+ 		SetPopupLine(PopupFunction, NSLOCTEXT("MuscleInfo", "Function", "What it does: {0}"), Info.Function);
+ 		SetPopupLine(PopupRunning, NSLOCTEXT("MuscleInfo", "Running", "When running: {0}"), Info.Running);
+ 		SetPopupLine(PopupInjury, NSLOCTEXT("MuscleInfo", "Injury", "Watch out for: {0}"), Info.Injury);
+-		PopupBox->SetVisibility(ESlateVisibility::Visible);
++		// Off by default: the assistant's chat box shows the description (see the header).
++		PopupBox->SetVisibility(bShowPopupOnSelect ? ESlateVisibility::Visible : ESlateVisibility::Collapsed);
+ 		return;
+ 	}
+ 	for (UAnatomyPickerComp* Other : Pickers)
+diff --git a/Source/MetaHumanTest/Private/IHPC_UI/CPP_UW_IHPCActionsPanel.cpp b/Source/MetaHumanTest/Private/IHPC_UI/CPP_UW_IHPCActionsPanel.cpp
+index 185b570..404fedc 100644
+--- a/Source/MetaHumanTest/Private/IHPC_UI/CPP_UW_IHPCActionsPanel.cpp
++++ b/Source/MetaHumanTest/Private/IHPC_UI/CPP_UW_IHPCActionsPanel.cpp
+@@ -118,6 +118,31 @@ FName UCPP_UW_IHPCActionsPanel::GetPlayingAction() const
+ 	return AvatarTimeline ? AvatarTimeline->GetCurrentAction() : NAME_None;
+ }
+ 
++TArray<FName> UCPP_UW_IHPCActionsPanel::GetAvailableActions() const
++{
++	TArray<FName> Names;
++	const UAnimationTimelineComp* AvatarTimeline = GetAvatarTimeline();
++	for (int32 Index = 0; Index < Actions.Num(); ++Index)
++	{
++		if (IsCardAvailable(Index, AvatarTimeline))
++		{
++			Names.Add(Actions[Index].ActionName);
++		}
++	}
++	return Names;
++}
++
++FName UCPP_UW_IHPCActionsPanel::GetHighlightedAction() const
++{
++	const FName Playing = GetPlayingAction();
++	if (!Playing.IsNone())
++	{
++		return Playing;
++	}
++	const int32 Index = Actions.IsValidIndex(LocomotionCardIndex) ? LocomotionCardIndex : GetDefaultCardIndex();
++	return Actions.IsValidIndex(Index) ? Actions[Index].ActionName : NAME_None;
++}
++
+ int32 UCPP_UW_IHPCActionsPanel::GetDefaultCardIndex() const
+ {
+ 	return Actions.IndexOfByPredicate([](const FIHPCActionInfo& Info) { return Info.bIsDefault; });
+diff --git a/Source/MetaHumanTest/Private/IHPC_UI/CPP_UW_IHPCChatPanel.cpp b/Source/MetaHumanTest/Private/IHPC_UI/CPP_UW_IHPCChatPanel.cpp
+index b7c4ca1..fd97711 100644
+--- a/Source/MetaHumanTest/Private/IHPC_UI/CPP_UW_IHPCChatPanel.cpp
++++ b/Source/MetaHumanTest/Private/IHPC_UI/CPP_UW_IHPCChatPanel.cpp
+@@ -22,6 +22,7 @@ UCPP_UW_IHPCChatPanel::UCPP_UW_IHPCChatPanel(const FObjectInitializer& ObjectIni
+ 	GreetingText = LOCTEXT("Greeting", "Hello, how may I assist you?");
+ 	BotBubbleColor = UIHPCUILibrary::FigmaColor(TEXT("FFFFFF"), 0.27f);
+ 	UserBubbleColor = UIHPCUILibrary::FigmaColor(TEXT("245983"), 0.9f);
++	StatusBubbleColor = UIHPCUILibrary::FigmaColor(TEXT("FFFFFF"), 0.12f);
+ 
+ 	// Fallback font (the Widget Blueprint sets Avenir Medium 11).
+ 	if (!IsRunningDedicatedServer())
+@@ -101,7 +102,45 @@ void UCPP_UW_IHPCChatPanel::ClearMessages()
+ 		MessageList->ClearChildren();
+ 	}
+ 	NumMessages = 0;
++	StatusBubble = nullptr;
+ 	AddGreetingIfEmpty();
++	RefreshStatusBubble();
++}
++
++void UCPP_UW_IHPCChatPanel::SetStatus(const FText& Status)
++{
++	StatusText = Status;
++	RefreshStatusBubble();
++}
++
++void UCPP_UW_IHPCChatPanel::ClearStatus()
++{
++	SetStatus(FText::GetEmpty());
++}
++
++void UCPP_UW_IHPCChatPanel::RefreshStatusBubble()
++{
++	if (!MessageList || !WidgetTree)
++	{
++		return;
++	}
++	// Made again each time: simplest way to keep it the last thing in the list.
++	if (StatusBubble)
++	{
++		MessageList->RemoveChild(StatusBubble);
++		StatusBubble = nullptr;
++	}
++	if (StatusText.IsEmpty())
++	{
++		return;
++	}
++	StatusBubble = MakeBubble(StatusText, StatusBubbleColor, StatusTextColor);
++	if (UScrollBoxSlot* StatusSlot = Cast<UScrollBoxSlot>(MessageList->AddChild(StatusBubble)))
++	{
++		StatusSlot->SetHorizontalAlignment(HAlign_Left);
++		StatusSlot->SetPadding(FMargin(0.f, NumMessages > 0 ? BubbleSpacing : 0.f, 0.f, 0.f));
++	}
++	MessageList->ScrollToEnd();
+ }
+ 
+ void UCPP_UW_IHPCChatPanel::FocusInput()
+@@ -130,33 +169,46 @@ void UCPP_UW_IHPCChatPanel::HandleTextCommitted(const FText& Text, ETextCommit::
+ 	}
+ }
+ 
+-void UCPP_UW_IHPCChatPanel::AddBubble(const FText& Message, bool bFromUser)
++UWidget* UCPP_UW_IHPCChatPanel::MakeBubble(const FText& Message, const FLinearColor& Fill, const FSlateColor& TextColor)
+ {
+-	if (!MessageList || !WidgetTree)
+-	{
+-		return;
+-	}
+-
+ 	// Rounded box (Figma bubble) with the text inside; the text wraps once the bubble reaches MaxBubbleWidth.
+ 	UBorder* Bubble = WidgetTree->ConstructWidget<UBorder>(UBorder::StaticClass());
+-	Bubble->SetBrush(UIHPCUILibrary::MakeRoundedBrush(bFromUser ? UserBubbleColor : BotBubbleColor, BubbleCornerRadius));
++	Bubble->SetBrush(UIHPCUILibrary::MakeRoundedBrush(Fill, BubbleCornerRadius));
+ 	Bubble->SetPadding(BubblePadding);
+ 	Bubble->SetVisibility(ESlateVisibility::HitTestInvisible);   // scrolling with the wheel still works over bubbles
+ 
+ 	UTextBlock* Text = WidgetTree->ConstructWidget<UTextBlock>(UTextBlock::StaticClass());
+ 	Text->SetText(Message);
+ 	Text->SetFont(BubbleFont);
+-	Text->SetColorAndOpacity(BubbleTextColor);
++	Text->SetColorAndOpacity(TextColor);
+ 	Text->SetAutoWrapText(false);
+ 	Text->SetWrapTextAt(FMath::Max(MaxBubbleWidth - BubblePadding.Left - BubblePadding.Right, 20.f));
+ 	Bubble->SetContent(Text);
++	return Bubble;
++}
++
++void UCPP_UW_IHPCChatPanel::AddBubble(const FText& Message, bool bFromUser)
++{
++	if (!MessageList || !WidgetTree)
++	{
++		return;
++	}
++
++	// The status line stays the last thing in the list: take it out, add the message, put it back.
++	if (StatusBubble)
++	{
++		MessageList->RemoveChild(StatusBubble);
++		StatusBubble = nullptr;
++	}
+ 
++	UWidget* Bubble = MakeBubble(Message, bFromUser ? UserBubbleColor : BotBubbleColor, BubbleTextColor);
+ 	if (UScrollBoxSlot* BubbleSlot = Cast<UScrollBoxSlot>(MessageList->AddChild(Bubble)))
+ 	{
+ 		BubbleSlot->SetHorizontalAlignment(bFromUser ? HAlign_Right : HAlign_Left);
+ 		BubbleSlot->SetPadding(FMargin(0.f, NumMessages > 0 ? BubbleSpacing : 0.f, 0.f, 0.f));
+ 	}
+ 	++NumMessages;
++	RefreshStatusBubble();
+ 	MessageList->ScrollToEnd();
+ }
+ 
+diff --git a/Source/MetaHumanTest/Private/IHPC_UI/CPP_UW_IHPCSideBar.cpp b/Source/MetaHumanTest/Private/IHPC_UI/CPP_UW_IHPCSideBar.cpp
+index a41acb5..d4d93bc 100644
+--- a/Source/MetaHumanTest/Private/IHPC_UI/CPP_UW_IHPCSideBar.cpp
++++ b/Source/MetaHumanTest/Private/IHPC_UI/CPP_UW_IHPCSideBar.cpp
+@@ -15,6 +15,8 @@
+ #include "Components/VerticalBoxSlot.h"
+ #include "Engine/Texture2D.h"
+ #include "Engine/World.h"
++#include "Framework/Application/SlateApplication.h"
++#include "Input/Events.h"
+ #include "Styling/SlateBrush.h"
+ #include "TimerManager.h"
+ 
+@@ -45,6 +47,17 @@ UCPP_UW_IHPCSideBar::UCPP_UW_IHPCSideBar(const FObjectInitializer& ObjectInitial
+ 	BotChatOpenLook.GlowStrength = 1.6f;
+ 	BotChatOpenLook.ParticleBrightness = 2.6f;
+ 
++	// Held for push-to-talk: the same hologram in red (only the colours and the glow are used from this look).
++	BotVoiceLook = BotChatOpenLook;
++	BotVoiceLook.BackgroundColor = FLinearColor(0.050f, 0.004f, 0.004f);
++	BotVoiceLook.FillColor = FLinearColor(0.32f, 0.030f, 0.025f);
++	BotVoiceLook.OutlineColor = FLinearColor(1.45f, 0.24f, 0.16f);
++	BotVoiceLook.GlowColor = FLinearColor(0.95f, 0.07f, 0.04f);
++	BotVoiceLook.ParticleColor = FLinearColor(1.0f, 0.22f, 0.12f);
++	BotVoiceLook.GridColor = FLinearColor(0.17f, 0.02f, 0.02f);
++	BotVoiceLook.GlowStrength = 2.1f;
++	BotVoiceLook.ParticleBrightness = 3.f;
++
+ 	// 120 motes all the time; only their brightness changes with the chat (changing the count restarts the dust).
+ 	BotAvatarSettings.Performance.ParticleCountOverride = 120;
+ 	// 240 px = exactly 4 pixels per cell of the 60 x 60 hologram grid. A size that is not a whole number of pixels
+@@ -165,10 +178,27 @@ void UCPP_UW_IHPCSideBar::NativeConstruct()
+ 	ApplyBotLook();
+ }
+ 
++void UCPP_UW_IHPCSideBar::NativeDestruct()
++{
++	EndBotHold();   // never leave the microphone recording when the HUD goes away
++	if (UWorld* World = GetWorld())
++	{
++		World->GetTimerManager().ClearTimer(BotHoldTimer);
++	}
++	Super::NativeDestruct();
++}
++
+ void UCPP_UW_IHPCSideBar::NativeTick(const FGeometry& MyGeometry, float InDeltaTime)
+ {
+ 	Super::NativeTick(MyGeometry, InDeltaTime);
+ 	UpdateBotLook(InDeltaTime);
++
++	// The pointer slid off the logo while holding it: the button reports no release in that case until the mouse
++	// button comes up somewhere else, and not at all on some touch screens. Stop when the press is really gone.
++	if (bBotHolding && BotButton && !BotButton->IsPressed())
++	{
++		EndBotHold();
++	}
+ }
+ 
+ void UCPP_UW_IHPCSideBar::ApplyStyles()
+@@ -249,13 +279,17 @@ void UCPP_UW_IHPCSideBar::UpdateBotLook(float DeltaTime)
+ 		return;
+ 	}
+ 	const float Target = bChatOpen ? 1.f : 0.f;
+-	if (BotLookBlend == Target)
++	const float VoiceTarget = bBotVoiceActive ? 1.f : 0.f;
++	if (BotLookBlend == Target && BotVoiceBlend == VoiceTarget)
+ 	{
+ 		return;   // nothing to do most frames
+ 	}
+ 	BotLookBlend = BotLookBlendTime > 0.f
+ 		? FMath::FInterpConstantTo(BotLookBlend, Target, DeltaTime, 1.f / BotLookBlendTime)
+ 		: Target;
++	BotVoiceBlend = BotVoiceBlendTime > 0.f
++		? FMath::FInterpConstantTo(BotVoiceBlend, VoiceTarget, DeltaTime, 1.f / BotVoiceBlendTime)
++		: VoiceTarget;
+ 	ApplyBotLook();
+ }
+ 
+@@ -269,10 +303,123 @@ void UCPP_UW_IHPCSideBar::ApplyBotLook()
+ 
+ 	FHoloAvatarSettings Settings = BotAvatarSettings;
+ 	Settings.Look = LerpBotLook(BotAvatarSettings.Look, BotChatOpenLook, T);
++	float Scale = FMath::Lerp(BotHologramScale, BotChatOpenHologramScale, T);
++
++	// Push-to-talk: the colours and the glow go to red on top of whichever look the chat gives; the shape stays.
++	if (BotVoiceBlend > 0.f)
++	{
++		const float V = FMath::SmoothStep(0.f, 1.f, BotVoiceBlend);
++		FHoloAvatarLook Red = Settings.Look;
++		Red.BackgroundColor = BotVoiceLook.BackgroundColor;
++		Red.FillColor = BotVoiceLook.FillColor;
++		Red.OutlineColor = BotVoiceLook.OutlineColor;
++		Red.GlowColor = BotVoiceLook.GlowColor;
++		Red.ParticleColor = BotVoiceLook.ParticleColor;
++		Red.GridColor = BotVoiceLook.GridColor;
++		Red.GlowStrength = BotVoiceLook.GlowStrength;
++		Red.ParticleBrightness = BotVoiceLook.ParticleBrightness;
++		Settings.Look = LerpBotLook(Settings.Look, Red, V);
++		Scale = FMath::Lerp(Scale, BotVoiceHologramScale, V);
++	}
+ 	BotAvatar->ApplySettings(Settings);
+ 
+ 	// Only the picture is scaled (a render transform): layout and the clickable area stay the 69 px button.
+-	BotAvatar->SetRenderScale(FVector2D(FMath::Lerp(BotHologramScale, BotChatOpenHologramScale, T)));
++	BotAvatar->SetRenderScale(FVector2D(Scale));
++}
++
++// ---------------------------------------------------------------------------
++// Push-to-talk: hold the BOT logo
++// ---------------------------------------------------------------------------
++
++void UCPP_UW_IHPCSideBar::SetBotVoiceActive(bool bActive)
++{
++	if (bBotVoiceActive == bActive)
++	{
++		return;
++	}
++	bBotVoiceActive = bActive;
++
++	if (BotButton && (!BotAvatar || !bBotAvatarIsOurs))
++	{
++		// The still picture, or a Holo Avatar placed by hand in the Widget Blueprint (its own look is left alone):
++		// there is no look to recolour, so the button's content is tinted instead.
++		BotButton->SetColorAndOpacity(bActive ? BotVoiceTint : FLinearColor::White);
++	}
++	if (bActive)
++	{
++		SetBotState(EHoloAvatarState::Listening);   // head still, ripples answer the microphone level
++	}
++	else
++	{
++		SetBotInputLevel(0.f);
++	}
++}
++
++void UCPP_UW_IHPCSideBar::SetBotInputLevel(float Level)
++{
++	if (BotAvatar)
++	{
++		if (UHoloAvatarSimulation* Simulation = BotAvatar->GetSimulation())
++		{
++			Simulation->SetInputLevel(FMath::Clamp(Level, 0.f, 1.f));
++		}
++	}
++}
++
++void UCPP_UW_IHPCSideBar::SimulateBotHold(float Seconds)
++{
++	UWorld* World = GetWorld();
++	if (!BotButton || !World || !FSlateApplication::IsInitialized())
++	{
++		return;
++	}
++	// The middle of the button on the screen. The events go through Slate's normal routing, so the button gets
++	// OnPressed / OnReleased (/ OnClicked) exactly as from a real pointer.
++	const FGeometry& Geometry = BotButton->GetCachedGeometry();
++	const FVector2D Where = Geometry.GetAbsolutePosition() + Geometry.GetAbsoluteSize() * 0.5;
++	FSlateApplication& Slate = FSlateApplication::Get();
++
++	const FPointerEvent Move(0, Where, Where, TSet<FKey>(), EKeys::Invalid, 0.f, FModifierKeysState());
++	Slate.ProcessMouseMoveEvent(Move);
++	const FPointerEvent Down(0, Where, Where, TSet<FKey>({ EKeys::LeftMouseButton }), EKeys::LeftMouseButton, 0.f, FModifierKeysState());
++	Slate.ProcessMouseButtonDownEvent(nullptr, Down);
++
++	World->GetTimerManager().SetTimer(SimulatedReleaseTimer, FTimerDelegate::CreateWeakLambda(this, [Where]()
++	{
++		if (FSlateApplication::IsInitialized())
++		{
++			const FPointerEvent Up(0, Where, Where, TSet<FKey>(), EKeys::LeftMouseButton, 0.f, FModifierKeysState());
++			FSlateApplication::Get().ProcessMouseButtonUpEvent(Up);
++		}
++	}), FMath::Max(Seconds, 0.01f), /*bLoop*/ false);
++}
++
++void UCPP_UW_IHPCSideBar::HandleBotHoldTimer()
++{
++	if (!bBotPressed || bBotHolding)
++	{
++		return;
++	}
++	bBotHolding = true;
++	bBotSwallowClick = true;   // letting go now is the end of the recording, not a click
++	SetBotVoiceActive(true);
++	OnBotVoiceHoldStarted.Broadcast();
++}
++
++void UCPP_UW_IHPCSideBar::EndBotHold()
++{
++	bBotPressed = false;
++	if (UWorld* World = GetWorld())
++	{
++		World->GetTimerManager().ClearTimer(BotHoldTimer);
++	}
++	if (!bBotHolding)
++	{
++		return;
++	}
++	bBotHolding = false;
++	SetBotVoiceActive(false);
++	OnBotVoiceHoldEnded.Broadcast();
+ }
+ 
+ void UCPP_UW_IHPCSideBar::SetBotState(EHoloAvatarState NewState, float Duration)
+@@ -343,6 +490,18 @@ void UCPP_UW_IHPCSideBar::HandleBotPressed()
+ 	{
+ 		BotButton->SetColorAndOpacity(FLinearColor(0.85f, 0.85f, 0.85f, 1.f));   // same dimming as the picture had
+ 	}
++
++	// A new press: it is a click until it has lasted BotHoldSeconds, then it is push-to-talk.
++	bBotPressed = true;
++	bBotHolding = false;
++	bBotSwallowClick = false;
++	if (BotHoldSeconds > 0.f)
++	{
++		if (UWorld* World = GetWorld())
++		{
++			World->GetTimerManager().SetTimer(BotHoldTimer, FTimerDelegate::CreateUObject(this, &UCPP_UW_IHPCSideBar::HandleBotHoldTimer), BotHoldSeconds, /*bLoop*/ false);
++		}
++	}
+ }
+ 
+ void UCPP_UW_IHPCSideBar::HandleBotReleased()
+@@ -351,6 +510,7 @@ void UCPP_UW_IHPCSideBar::HandleBotReleased()
+ 	{
+ 		BotButton->SetColorAndOpacity(FLinearColor::White);
+ 	}
++	EndBotHold();   // the button fires OnReleased before OnClicked, so bBotSwallowClick is still set for the click
+ }
+ 
+ void UCPP_UW_IHPCSideBar::SetExpanded(bool bInExpanded)
+@@ -431,6 +591,11 @@ void UCPP_UW_IHPCSideBar::HandleExpandClicked()
+ 
+ void UCPP_UW_IHPCSideBar::HandleBotClicked()
+ {
++	if (bBotSwallowClick)
++	{
++		bBotSwallowClick = false;   // this "click" was the end of a push-to-talk hold
++		return;
++	}
+ 	ToggleChat();
+ }
+ 
+diff --git a/Source/MetaHumanTest/Public/Assistant/IHPCAssistantComp.h b/Source/MetaHumanTest/Public/Assistant/IHPCAssistantComp.h
+new file mode 100644
+index 0000000..4f3c37e
+--- /dev/null
++++ b/Source/MetaHumanTest/Public/Assistant/IHPCAssistantComp.h
+@@ -0,0 +1,345 @@
++// IHPCAssistantComp.h
++// -----------------------------------------------------------------------------
++// The AI ASSISTANT behind the BOT chat. Lives on the player controller (ACPP_PlayerController creates it), so the
++// conversation and the server connection outlive a pawn switch.
++//
++//   chat box: type + Enter  ─┐
++//   hold the BOT logo: talk ─┤──►  POST /v1/chat   {text, context}            ──►  AI server (DGX Spark)
++//                            │     POST /v1/voice  {wav, context}                  Whisper -> rules -> LLM
++//                            │◄──  {transcript, reply, actions[]}             ◄──
++//                            ▼
++//       runs the actions on the avatar (layer, timeline, camera, pose estimation, "show me the biceps" ...)
++//       and writes the reply into the chat box
++//
++// The server decides WHAT to do; this component does it and knows whether it worked. It only ever makes outgoing
++// HTTP requests, so it works across the internet (the app in one city, the AI computer in another).
++// The contract with the server is docs/PROTOCOL.md of the repository MHTNewUI-AI-Assistant-Unreal (the same file is
++// in MHTNewUI-AI-Assistant-Server). Protocol version: 1.
++//
++// It also does one thing with no server at all: a CLICK on a muscle or bone writes its description into the chat
++// box (this replaced the info popup of UCPP_UW_MuscleInfo).
++//
++// Files:
++//   IHPCAssistantComp.cpp          start-up, the chat, the request queue, HTTP, the answer
++//   IHPCAssistantContext.cpp       what is sent with every request: the avatar's state and the names it knows
++//   IHPCAssistantActions.cpp       one function per action type
++//   IHPCAssistantVoice.h / .cpp    microphone -> WAV (push-to-talk)
++//
++// In the chat box:   /server <url>   /key <text>   /status   /clear   /help
++//                    /do <action type> key=value ...   (runs one action without the server, like Assistant.Do)
++// Console (also the editor's Cmd box during Play):
++//   Assistant.Ask <text>        same as typing <text> in the chat box
++//   Assistant.Do <json>         run one action without the server, e.g. Assistant.Do {"type":"set_layer","layer":"muscles"}
++//   Assistant.Server [host:port] show / change (and remember) the server address. No "http://" here: the console
++//                               reads "//" as a comment. ("/server http://host:8010" in the chat box is fine.)
++//   Assistant.Key [text]        show whether a key is set / change (and remember) it
++//   Assistant.Status            ask the server for its /health
++//   Assistant.Talk 1 | 0        start / stop-and-send a microphone recording (same as holding the BOT logo)
++//   Assistant.SendWav <file>    send a .wav file from disk as if it had been spoken
++//   Assistant.HoldLogo [s]      TEST: press, hold and release the BOT logo through Slate's own pointer events
++// Command line:      -AssistantURL=http://host:8010   -AssistantKey=...
++// -----------------------------------------------------------------------------
++
++#pragma once
++
++#include "CoreMinimal.h"
++#include "Components/ActorComponent.h"
++#include "Interfaces/IHttpRequest.h"
++#include "IHPC_UI/IHPCTypes.h"
++#include "PoseEstimation/PoseTypes.h"   // FPoseFrameResult (a UFUNCTION parameter needs the whole type)
++#include "IHPCAssistantComp.generated.h"
++
++class APawn;
++class FJsonObject;
++class FIHPCVoiceRecorder;
++class UAnatomyPickerComp;
++class UCPP_UW_IHPCHud;
++class UCPP_UW_IHPCChatPanel;
++class UCPP_UW_IHPCSideBar;
++class UCPP_MouseFunctionComp;
++class USkeletalMeshComponent;
++
++DECLARE_LOG_CATEGORY_EXTERN(LogIHPCAssistant, Log, All);
++
++/** The assistant answered. Transcript = what it understood (what was typed, or what was heard), Reply = its text. */
++DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FIHPCAssistantReply, const FString&, Transcript, const FString&, Reply);
++
++/** What happened to one action. Sent back to the server with the next request (context.last_results). */
++struct FIHPCActionResult
++{
++	FString Type;
++	bool bOk = false;
++	FString Message;   // empty on success, one sentence for the user on failure
++};
++
++/** One muscle or bone of the possessed avatar (one side of it). */
++struct FIHPCPartRef
++{
++	TWeakObjectPtr<UAnatomyPickerComp> Picker;
++	int32 Id = 0;
++	FString Kind;     // "muscle" | "bone"
++	FString Name;     // as in the atlas: "Biceps brachii"
++	FString Side;     // "left" | "right" | "center"
++	FString Region;
++	FString Key;      // normalised Name, for matching
++};
++
++UCLASS(ClassGroup=(Custom), meta=(BlueprintSpawnableComponent))
++class METAHUMANTEST_API UIHPCAssistantComp : public UActorComponent
++{
++	GENERATED_BODY()
++
++public:
++	UIHPCAssistantComp();
++
++	// ---------------------------------------------------------------- server
++
++	/** The AI server (the DGX Spark), e.g. "http://spark:8010". Changed at run time with "/server <url>" in the chat
++	 *  box (remembered on this computer) or -AssistantURL= on the command line; those win over this value. */
++	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Assistant|Server")
++	FString ServerURL = TEXT("http://127.0.0.1:8010");
++
++	/** Sent as "Authorization: Bearer <key>" when not empty. Must be the server's ASSISTANT_API_KEY.
++	 *  Changed at run time with "/key <text>" (remembered on this computer) or -AssistantKey=. */
++	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Assistant|Server")
++	FString ApiKey;
++
++	/** Seconds to wait for an answer. */
++	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Assistant|Server", meta=(ClampMin="1"))
++	float RequestTimeout = 30.f;
++
++	/** Ask the server for its /health when Play starts (a line in the log; nothing in the chat). */
++	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Assistant|Server")
++	bool bCheckServerOnBeginPlay = true;
++
++	// ---------------------------------------------------------------- voice (hold the BOT logo)
++
++	/** A recording stops and is sent by itself after this long. */
++	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Assistant|Voice", meta=(ClampMin="1"))
++	float MaxRecordSeconds = 15.f;
++
++	/** Shorter recordings are thrown away (a hold that was let go straight away). */
++	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Assistant|Voice", meta=(ClampMin="0"))
++	float MinRecordSeconds = 0.4f;
++
++	// ---------------------------------------------------------------- muscles and bones
++
++	/** Write the description of a clicked muscle / bone into the chat box (instead of the old info popup). */
++	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Assistant|Anatomy")
++	bool bDescribeClickedParts = true;
++
++	/** Open the chat window when a description is written into it. */
++	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Assistant|Anatomy")
++	bool bOpenChatForDescriptions = true;
++
++	/** "Show me the biceps": the camera stops this many times the muscle's size away from it, plus Focus Distance
++	 *  Extra (cm), and never closer than Focus Min Distance. */
++	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Assistant|Anatomy", meta=(ClampMin="0.5"))
++	float FocusDistanceScale = 3.2f;
++
++	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Assistant|Anatomy", meta=(ClampMin="0"))
++	float FocusDistanceExtra = 55.f;
++
++	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Assistant|Anatomy", meta=(ClampMin="0"))
++	float FocusMinDistance = 90.f;
++
++	/** Seconds a camera move asked for by the assistant takes. 0 = jump. */
++	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Assistant|Camera", meta=(ClampMin="0"))
++	float CameraMoveSeconds = 0.7f;
++
++	/** How long "read the pose data" waits for the first analysed frame after pose estimation was switched on. */
++	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Assistant|Pose", meta=(ClampMin="0"))
++	float PoseReadTimeout = 10.f;
++
++	// ---------------------------------------------------------------- events
++
++	/** Fires for every answer (after its actions ran). Hook text-to-speech here. */
++	UPROPERTY(BlueprintAssignable, Category="Assistant")
++	FIHPCAssistantReply OnAssistantReply;
++
++	// ---------------------------------------------------------------- calls
++
++	/** Same as typing Text in the chat box and pressing Enter. */
++	UFUNCTION(BlueprintCallable, Category="Assistant")
++	void Ask(const FString& Text);
++
++	/** Start recording the microphone (push-to-talk pressed). False if the microphone could not be opened. */
++	UFUNCTION(BlueprintCallable, Category="Assistant|Voice")
++	bool StartVoice();
++
++	/** Stop recording and send what was said to the server (push-to-talk released). */
++	UFUNCTION(BlueprintCallable, Category="Assistant|Voice")
++	void StopVoiceAndSend();
++
++	/** Stop recording and throw the recording away. */
++	UFUNCTION(BlueprintCallable, Category="Assistant|Voice")
++	void CancelVoice();
++
++	UFUNCTION(BlueprintPure, Category="Assistant|Voice")
++	bool IsRecording() const;
++
++	/** Send a .wav file from disk as if it had been spoken (tests without a microphone). */
++	UFUNCTION(BlueprintCallable, Category="Assistant|Voice")
++	bool SendWavFile(const FString& FilePath);
++
++	/** Run one action given as JSON text (the "actions" entries of docs/PROTOCOL.md), without the server.
++	 *  Returns true if it worked; OutMessage says why not. */
++	UFUNCTION(BlueprintCallable, Category="Assistant")
++	bool RunActionJson(const FString& ActionJson, FString& OutMessage);
++
++	/** The address requests go to: command line, else what "/server" remembered, else Server URL. No trailing slash. */
++	UFUNCTION(BlueprintPure, Category="Assistant|Server")
++	FString GetServerURL() const;
++
++	/** Change the server address. bRemember: keep it for the next runs on this computer (GameUserSettings.ini). */
++	UFUNCTION(BlueprintCallable, Category="Assistant|Server")
++	void SetServerURL(const FString& NewURL, bool bRemember = true);
++
++	UFUNCTION(BlueprintCallable, Category="Assistant|Server")
++	void SetApiKey(const FString& NewKey, bool bRemember = true);
++
++	/** GET /health; the answer is written into the chat box (bToChat) and the log. */
++	UFUNCTION(BlueprintCallable, Category="Assistant|Server")
++	void CheckServer(bool bToChat = true);
++
++	/** True while a request is on its way or waiting its turn. */
++	UFUNCTION(BlueprintPure, Category="Assistant")
++	bool IsBusy() const { return bRequestInFlight || Queue.Num() > 0; }
++
++	/** Writes the description of a muscle / bone into the chat box. */
++	void DescribePart(const UAnatomyPickerComp* Picker, int32 PartId);
++
++protected:
++	virtual void BeginPlay() override;
++	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
++	virtual void TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction) override;
++
++private:
++	// ---- UI / pawn hook-up (IHPCAssistantComp.cpp)
++
++	/** Finds the HUD (it is created after this component begins play) and binds the chat box and the BOT logo. */
++	void EnsureHud();
++
++	/** Binds to the possessed pawn's pickers (muscles, bones) and rebuilds the list of names. */
++	void BindToPawn(APawn* Pawn);
++
++	UFUNCTION() void HandleChatMessageSent(const FText& Text);
++	UFUNCTION() void HandleBotVoiceHoldStarted();
++	UFUNCTION() void HandleBotVoiceHoldEnded();
++	UFUNCTION() void HandlePartSelectionChanged(int32 PartId);
++	UFUNCTION() void HandlePoseEstimated(const FPoseFrameResult& Result);
++
++	UCPP_UW_IHPCHud* GetHud() const { return Hud.Get(); }
++	UCPP_UW_IHPCChatPanel* GetChat() const;
++	UCPP_UW_IHPCSideBar* GetSideBar() const;
++	APawn* GetAvatar() const;
++
++	/** A bot bubble in the chat box (opens the chat first if bOpenChat). Kept for later if the HUD is not there yet. */
++	void Say(const FString& Text, bool bOpenChat = false);
++	void SetStatus(const FString& Text);
++
++	/** Handles "/server ...", "/key ...", "/status", "/clear", "/help". True if Text was one of them. */
++	bool HandleSlashCommand(const FString& Text);
++
++	// ---- requests (IHPCAssistantComp.cpp)
++
++	struct FRequest
++	{
++		bool bVoice = false;
++		FString Text;                 // typed text, or the transcript when a voice request is repeated with the catalog
++		TArray<uint8> Wav;            // voice only
++		bool bForceCatalog = false;   // the server asked for the catalog
++		bool bCatalogRetry = false;   // this is that repeat: never ask a second time
++	};
++
++	void Enqueue(FRequest&& Request);
++	void SendNext();
++	void HandleResponse(FHttpRequestPtr HttpRequest, FHttpResponsePtr Response, bool bConnected, int32 Serial);
++	void HandleHealthResponse(FHttpRequestPtr HttpRequest, FHttpResponsePtr Response, bool bConnected, bool bToChat);
++	void ApplyAnswer(const TSharedPtr<FJsonObject>& Answer, const FRequest& Request);
++	void FinishRequest();
++	void AddAuthHeader(const TSharedRef<IHttpRequest, ESPMode::ThreadSafe>& HttpRequest) const;
++	FString GetApiKey() const;
++
++	TArray<FRequest> Queue;
++	FRequest Current;
++	bool bRequestInFlight = false;
++	int32 RequestSerial = 0;
++	FString SessionId;
++
++	// ---- context and catalog (IHPCAssistantContext.cpp)
++
++	/** The avatar's state, sent with every request (docs/PROTOCOL.md, Context). */
++	TSharedRef<FJsonObject> BuildContext() const;
++
++	/** The request body shared by /v1/chat and /v1/voice. */
++	FString BuildRequestBody(const FRequest& Request, bool& bOutIncludedCatalog) const;
++
++	/** Rebuilds Parts and the catalog (the names of the avatar's muscles and bones) from the bound pickers. */
++	void RebuildCatalog();
++
++	static FString NormalizeName(const FString& Name);
++	static FString NormalizeSide(const FString& Side);
++
++	TArray<TWeakObjectPtr<UAnatomyPickerComp>> Pickers;
++	/** The part we last described for each picker, 0 after it was cleared (to tell which picker an event comes from,
++	 *  and not to describe the same selection twice). */
++	TMap<TWeakObjectPtr<UAnatomyPickerComp>, int32> LastSelected;
++	TWeakObjectPtr<APawn> BoundPawn;
++	TArray<FIHPCPartRef> Parts;
++	FString CatalogJson;          // {"parts":[...]}
++	FString CatalogId;
++	FString CatalogIdSent;        // the catalog the server already got in this session
++	float RebindCooldown = 0.f;
++
++	// ---- actions (IHPCAssistantActions.cpp)
++
++	FIHPCActionResult RunAction(const TSharedPtr<FJsonObject>& Action);
++
++	FIHPCActionResult DoSetLayer(const FJsonObject& Action);
++	FIHPCActionResult DoTimeline(const FJsonObject& Action);
++	FIHPCActionResult DoCamera(const FJsonObject& Action);
++	FIHPCActionResult DoPoseEstimation(const FJsonObject& Action);
++	FIHPCActionResult DoReadPoseData(const FJsonObject& Action);
++	FIHPCActionResult DoShowPart(const FJsonObject& Action);
++	FIHPCActionResult DoClearSelection(const FJsonObject& Action);
++	FIHPCActionResult DoPlayAction(const FJsonObject& Action);
++	FIHPCActionResult DoOpenPanel(const FJsonObject& Action);
++	FIHPCActionResult DoSwitchAvatar(const FJsonObject& Action);
++
++	/** The entry for Kind + Name + Side; with no side, the one nearer to the camera. Null if the avatar has none. */
++	const FIHPCPartRef* FindPart(const FString& Kind, const FString& Name, const FString& Side) const;
++
++	/** Which way the avatar faces and where its right is (world space, horizontal), and the middle of its hips. */
++	bool GetAvatarFrame(FVector& OutOrigin, FVector& OutForward, FVector& OutRight) const;
++	UCPP_MouseFunctionComp* GetCamera() const;
++
++	/** The current angles as chat text. Empty if pose estimation has no person right now. */
++	FString FormatPoseData(const TArray<FString>& OnlyTheseAngles) const;
++	bool HasFreshPose() const;
++
++	TArray<FIHPCActionResult> LastResults;
++
++	/** While an answer's actions run, text they produce (descriptions, pose data) waits here so it lands in the
++	 *  chat box after the reply, not before it. */
++	bool bDeferMessages = false;
++	TArray<FString> DeferredMessages;
++
++	/** "read the pose data" asked before the first analysed frame: answered from the tick when one arrives. */
++	bool bPoseReadPending = false;
++	double PoseReadDeadline = 0.0;
++	TArray<FString> PoseReadAngles;
++	double LastPoseResultTime = 0.0;
++	bool bPoseEventBound = false;
++
++	// ---- voice (IHPCAssistantVoice.cpp)
++
++	TSharedPtr<FIHPCVoiceRecorder> Recorder;
++	double RecordStartTime = 0.0;
++
++	// ---- UI
++
++	TWeakObjectPtr<UCPP_UW_IHPCHud> Hud;
++	float HudSearchCooldown = 0.f;
++	TArray<FString> SayBeforeHud;   // bot text produced before the HUD existed
++};
+diff --git a/Source/MetaHumanTest/Public/CPP_UW_MuscleInfo.h b/Source/MetaHumanTest/Public/CPP_UW_MuscleInfo.h
+index 81b7161..26991d2 100644
+--- a/Source/MetaHumanTest/Public/CPP_UW_MuscleInfo.h
++++ b/Source/MetaHumanTest/Public/CPP_UW_MuscleInfo.h
+@@ -1,6 +1,10 @@
+ // Muscle info widget (WB_MuscleInfo): a small name tooltip that follows the mouse while a muscle (or bone) is
+-// hovered, and an info popup when one is clicked. It listens to every UAnatomyPickerComp on the possessed pawn
+-// (one per pickable layer: muscles, skeleton) and shows whichever one reported last.
++// hovered. It listens to every UAnatomyPickerComp on the possessed pawn (one per pickable layer: muscles, skeleton)
++// and shows whichever one reported last.
++//
++// A CLICK no longer opens this widget's info popup: the description of the clicked muscle / bone is written into the
++// assistant's chat box instead (UIHPCAssistantComp, which listens to the same pickers). Tick "Show Popup On Select"
++// to get the old popup back. Either way this widget keeps one selection at a time across the layers.
+ 
+ #pragma once
+ 
+@@ -27,6 +31,11 @@ public:
+ 	UPROPERTY(BlueprintReadOnly, Category="Muscle Info")
+ 	TArray<TObjectPtr<UAnatomyPickerComp>> Pickers;
+ 
++	/** Show the info popup when a muscle / bone is clicked. Off: the description goes to the assistant's chat box
++	 *  (UIHPCAssistantComp) and the popup stays hidden. */
++	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Muscle Info")
++	bool bShowPopupOnSelect = false;
++
+ 	/** Tooltip offset from the mouse cursor (viewport units). */
+ 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Muscle Info")
+ 	FVector2D TooltipOffset = FVector2D(18.0, 14.0);
+diff --git a/Source/MetaHumanTest/Public/IHPC_UI/CPP_UW_IHPCActionsPanel.h b/Source/MetaHumanTest/Public/IHPC_UI/CPP_UW_IHPCActionsPanel.h
+index c0f79c5..40bba21 100644
+--- a/Source/MetaHumanTest/Public/IHPC_UI/CPP_UW_IHPCActionsPanel.h
++++ b/Source/MetaHumanTest/Public/IHPC_UI/CPP_UW_IHPCActionsPanel.h
+@@ -75,6 +75,16 @@ public:
+ 	UFUNCTION(BlueprintPure, Category = "IHPC|Actions")
+ 	FName GetPlayingAction() const;
+ 
++	/** The action names the possessed pawn can do right now (the cards that are not greyed out), top to bottom.
++	 *  The assistant sends these to the AI server so "make her jump" only picks something that exists. */
++	UFUNCTION(BlueprintPure, Category = "IHPC|Actions")
++	TArray<FName> GetAvailableActions() const;
++
++	/** The action whose card is highlighted: the playing clip, or the Idle / walk / jog / run card that was picked
++	 *  last while no clip plays. None if there are no cards. */
++	UFUNCTION(BlueprintPure, Category = "IHPC|Actions")
++	FName GetHighlightedAction() const;
++
+ 	/** Re-reads the possessed pawn: which cards are available and which one is highlighted. */
+ 	UFUNCTION(BlueprintCallable, Category = "IHPC|Actions")
+ 	void RefreshCards();
+diff --git a/Source/MetaHumanTest/Public/IHPC_UI/CPP_UW_IHPCChatPanel.h b/Source/MetaHumanTest/Public/IHPC_UI/CPP_UW_IHPCChatPanel.h
+index 911b1ab..0cc3018 100644
+--- a/Source/MetaHumanTest/Public/IHPC_UI/CPP_UW_IHPCChatPanel.h
++++ b/Source/MetaHumanTest/Public/IHPC_UI/CPP_UW_IHPCChatPanel.h
+@@ -14,8 +14,11 @@
+ //   * Shows the greeting when it first opens.
+ //   * Typing + Enter (or the send button) adds the user's message as a bubble on the right and fires
+ //     OnMessageSent - that is where a chatbot / LLM backend plugs in (Blueprint or C++). The backend answers by
+-//     calling AddBotMessage. No assistant is connected yet, so by default nothing answers; set PlaceholderReply to
+-//     have a fixed reply while testing.
++//     calling AddBotMessage. The project's backend is UIHPCAssistantComp (Assistant/IHPCAssistantComp.h, on the player
++//     controller): it sends the message to the AI server and runs the actions that come back. Without it nothing
++//     answers; set PlaceholderReply to have a fixed reply while testing.
++//   * SetStatus shows a temporary line at the bottom ("Listening...", "Thinking...") while the assistant is busy.
++//   * The muscle / bone descriptions are shown here too (a click on a muscle adds a bot bubble), not in a popup.
+ //
+ // Widget Blueprint: /Game/UserInterface/IHPC/Widgets/WBP_IHPC_ChatPanel
+ //   Needs a ScrollBox "MessageList", an EditableTextBox "MessageInput" and a Button "SendButton".
+@@ -65,6 +68,13 @@ public:
+ 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "IHPC|Style")
+ 	FSlateColor BubbleTextColor = FSlateColor(FLinearColor::White);
+ 
++	/** Fill of the status line ("Listening...", "Thinking..."): fainter than a bot bubble, so it reads as temporary. */
++	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "IHPC|Style")
++	FLinearColor StatusBubbleColor;
++
++	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "IHPC|Style")
++	FSlateColor StatusTextColor = FSlateColor(FLinearColor(1.f, 1.f, 1.f, 0.7f));
++
+ 	/** Bubble text (Figma: Avenir Medium 15 px = 11 pt). */
+ 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "IHPC|Style")
+ 	FSlateFontInfo BubbleFont;
+@@ -106,6 +116,17 @@ public:
+ 	UFUNCTION(BlueprintCallable, Category = "IHPC|Chat")
+ 	void SubmitMessage(const FText& Message);
+ 
++	/** Shows a temporary line at the bottom of the list, on the assistant's side ("Listening...", "Thinking...").
++	 *  It replaces the previous status and stays below new messages until ClearStatus. Empty = ClearStatus. */
++	UFUNCTION(BlueprintCallable, Category = "IHPC|Chat")
++	void SetStatus(const FText& Status);
++
++	UFUNCTION(BlueprintCallable, Category = "IHPC|Chat")
++	void ClearStatus();
++
++	UFUNCTION(BlueprintPure, Category = "IHPC|Chat")
++	FText GetStatus() const { return StatusText; }
++
+ 	/** Removes every bubble (the greeting comes back). */
+ 	UFUNCTION(BlueprintCallable, Category = "IHPC|Chat")
+ 	void ClearMessages();
+@@ -131,6 +152,18 @@ private:
+ 
+ 	void AddBubble(const FText& Message, bool bFromUser);
+ 
++	/** Makes one bubble (rounded box + wrapped text) without adding it to the list. */
++	UWidget* MakeBubble(const FText& Message, const FLinearColor& Fill, const FSlateColor& TextColor);
++
++	/** Puts the status line (if any) back at the end of the list. */
++	void RefreshStatusBubble();
++
++	/** The status line's bubble while one is shown. */
++	UPROPERTY(Transient)
++	TObjectPtr<UWidget> StatusBubble;
++
++	FText StatusText;
++
+ 	/** Shows the greeting if the list is empty. */
+ 	void AddGreetingIfEmpty();
+ 
+diff --git a/Source/MetaHumanTest/Public/IHPC_UI/CPP_UW_IHPCHud.h b/Source/MetaHumanTest/Public/IHPC_UI/CPP_UW_IHPCHud.h
+index 40eedb8..96c656e 100644
+--- a/Source/MetaHumanTest/Public/IHPC_UI/CPP_UW_IHPCHud.h
++++ b/Source/MetaHumanTest/Public/IHPC_UI/CPP_UW_IHPCHud.h
+@@ -144,8 +144,8 @@ public:
+ 	UPROPERTY(BlueprintAssignable, Category = "IHPC|Events")
+ 	FIHPCActionChanged OnActionChanged;
+ 
+-	/** The user sent a chat message to the assistant (BOT). Connect a chatbot here; answer with
+-	 *  GetChatPanel()->AddBotMessage. */
++	/** The user sent a chat message to the assistant (BOT). The project's assistant (UIHPCAssistantComp on the player
++	 *  controller) listens to the chat panel itself; this event is for anything else that wants to follow the chat. */
+ 	UPROPERTY(BlueprintAssignable, Category = "IHPC|Events")
+ 	FIHPCTextEvent OnChatMessageSent;
+ 
+@@ -236,6 +236,9 @@ public:
+ 	UFUNCTION(BlueprintPure, Category = "IHPC|HUD")
+ 	UCPP_UW_IHPCChatPanel* GetChatPanel() const;
+ 
++	UFUNCTION(BlueprintPure, Category = "IHPC|HUD")
++	UCPP_UW_IHPCActionsPanel* GetActionsPanel() const { return ActionsPanel; }
++
+ 	// ---------------------------------------------------------------- OLD nav bar calls (still work)
+ 
+ 	/** OLD: selects the side panel that replaced the nav tab (Saved Videos -> Saved Videos, History & Timeline ->
+diff --git a/Source/MetaHumanTest/Public/IHPC_UI/CPP_UW_IHPCSideBar.h b/Source/MetaHumanTest/Public/IHPC_UI/CPP_UW_IHPCSideBar.h
+index e53281c..ce965a8 100644
+--- a/Source/MetaHumanTest/Public/IHPC_UI/CPP_UW_IHPCSideBar.h
++++ b/Source/MetaHumanTest/Public/IHPC_UI/CPP_UW_IHPCSideBar.h
+@@ -9,6 +9,9 @@
+ //                      its head, listens while the chat is open, thinks after a message is sent and talks while
+ //                      the assistant answers. Opening the chat also turns it up: bigger, brighter, more dust.
+ //                      Untick "Animated Bot" to get the still picture back.
++//                      A CLICK opens / closes the chat. HOLDING it (Bot Hold Seconds) is push-to-talk: the logo
++//                      turns red, OnBotVoiceHoldStarted fires (the assistant starts recording the microphone),
++//                      and letting go fires OnBotVoiceHoldEnded (the recording is sent). A hold is not a click.
+ //   +-----+         <- pill "Rectangle 24": rgba(12,39,61,0.59), 69 wide, fully rounded
+ //   | (=) |   Body      \
+ //   | (m) |   Muscles    > layer switcher (WBP_IHPC_LayerSwitcher, same C++ as before - drives the AnatomyView)
+@@ -148,8 +151,40 @@ public:
+ 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "IHPC|Bot", meta = (ClampMin = "0", EditCondition = "bAnimatedBot"))
+ 	float BotSpeakingSecondsPerCharacter = 0.06f;
+ 
++	// ---------------------------------------------------------------- push-to-talk (hold the BOT logo)
++
++	/** Holding the BOT logo this long (seconds) starts push-to-talk; a shorter press is a click (chat open / close).
++	 *  0 = no push-to-talk. */
++	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "IHPC|Bot|Voice", meta = (ClampMin = "0"))
++	float BotHoldSeconds = 0.3f;
++
++	/** The logo's look while it is held and the microphone records: the same hologram in red. Colours and glow are
++	 *  taken from here; the shape (edge, opacity) stays what the chat-open look has. */
++	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "IHPC|Bot|Voice", meta = (EditCondition = "bAnimatedBot"))
++	FHoloAvatarLook BotVoiceLook;
++
++	/** Size of the hologram while recording, times the 69 px button. */
++	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "IHPC|Bot|Voice", meta = (ClampMin = "0.5", ClampMax = "4", EditCondition = "bAnimatedBot"))
++	float BotVoiceHologramScale = 1.75f;
++
++	/** Seconds the logo takes to turn red / back. */
++	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "IHPC|Bot|Voice", meta = (ClampMin = "0"))
++	float BotVoiceBlendTime = 0.15f;
++
++	/** Tint of the still picture while recording (used when Animated Bot is off). */
++	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "IHPC|Bot|Voice")
++	FLinearColor BotVoiceTint = FLinearColor(1.f, 0.22f, 0.18f, 1.f);
++
+ 	// ---------------------------------------------------------------- events
+ 
++	/** The BOT logo has been held for Bot Hold Seconds: start recording the microphone. The logo is already red. */
++	UPROPERTY(BlueprintAssignable, Category = "IHPC|Events")
++	FIHPCSimpleEvent OnBotVoiceHoldStarted;
++
++	/** The held BOT logo was let go (or the pointer left it): stop recording and send. */
++	UPROPERTY(BlueprintAssignable, Category = "IHPC|Events")
++	FIHPCSimpleEvent OnBotVoiceHoldEnded;
++
+ 	/** A tab was clicked (the HUD opens / closes its panel). */
+ 	UPROPERTY(BlueprintAssignable, Category = "IHPC|Events")
+ 	FIHPCSideTabEvent OnTabClicked;
+@@ -208,11 +243,29 @@ public:
+ 	UFUNCTION(BlueprintCallable, Category = "IHPC|Bot")
+ 	void SetBotSpeechLevel(float Level);
+ 
++	/** Turns the logo red (true) or back to normal (false). Holding the logo does this by itself; the assistant
++	 *  calls it with false when the microphone could not be opened, or with true to record without a hold. */
++	UFUNCTION(BlueprintCallable, Category = "IHPC|Bot|Voice")
++	void SetBotVoiceActive(bool bActive);
++
++	UFUNCTION(BlueprintPure, Category = "IHPC|Bot|Voice")
++	bool IsBotVoiceActive() const { return bBotVoiceActive; }
++
++	/** Feed the microphone loudness (0..1) while recording: ripples on the red logo answer it. */
++	UFUNCTION(BlueprintCallable, Category = "IHPC|Bot|Voice")
++	void SetBotInputLevel(float Level);
++
++	/** TEST: presses the BOT logo, holds it for Seconds and lets go, by sending pointer events through Slate - the
++	 *  same path a finger or the mouse takes (console: "Assistant.HoldLogo 3"). Under Bot Hold Seconds = a click. */
++	UFUNCTION(BlueprintCallable, Category = "IHPC|Bot|Voice")
++	void SimulateBotHold(float Seconds = 2.f);
++
+ 	TArray<UCPP_UW_IHPCSideTab*> GetTabs() const;
+ 
+ protected:
+ 	virtual void NativePreConstruct() override;
+ 	virtual void NativeConstruct() override;
++	virtual void NativeDestruct() override;
+ 	virtual void NativeTick(const FGeometry& MyGeometry, float InDeltaTime) override;
+ 
+ 	/** The assistant avatar (opens the chat window). */
+@@ -254,6 +307,12 @@ private:
+ 	/** Listening while the chat is open, Idle otherwise. */
+ 	void RestBotState();
+ 
++	/** The logo was held long enough: push-to-talk starts. */
++	void HandleBotHoldTimer();
++
++	/** Ends a hold (button released, pointer left the button while pressed, widget removed). */
++	void EndBotHold();
++
+ 	/** Moves BotLookBlend toward 0 (chat closed) or 1 (chat open) and, while it is moving, applies the look. */
+ 	void UpdateBotLook(float DeltaTime);
+ 
+@@ -275,6 +334,20 @@ private:
+ 	/** 0 = the closed look (BotAvatarSettings.Look), 1 = the chat-open look (BotChatOpenLook). */
+ 	float BotLookBlend = 0.f;
+ 
++	/** 0 = normal colours, 1 = the red recording look (BotVoiceLook). */
++	float BotVoiceBlend = 0.f;
++
++	/** Starts push-to-talk when the logo has been held for BotHoldSeconds. */
++	FTimerHandle BotHoldTimer;
++
++	/** Lets go of a SimulateBotHold press. */
++	FTimerHandle SimulatedReleaseTimer;
++
++	bool bBotPressed = false;       // the logo is being pressed right now
++	bool bBotHolding = false;       // ... and has been for BotHoldSeconds: push-to-talk is on
++	bool bBotSwallowClick = false;  // the click that ends a hold must not open / close the chat
++	bool bBotVoiceActive = false;   // the logo is (turning) red
++
+ 	/** False when the Holo Avatar was put in the Widget Blueprint by hand: its own look is then left alone. */
+ 	bool bBotAvatarIsOurs = false;
+ 

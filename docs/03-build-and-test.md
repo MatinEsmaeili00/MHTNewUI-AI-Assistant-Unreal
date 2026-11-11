@@ -1,0 +1,169 @@
+# 03 - Build and test
+
+What was run on 2026-11-11, in order, and what came back. Mac, Unreal Engine 5.8, Metal, level `Main`,
+avatar `BP_MH_CH_Abby8` (and `Beau` for the avatar switch).
+
+## Build
+
+With the editor closed:
+
+```sh
+"/Users/Shared/Epic Games/UE_5.8/Engine/Build/BatchFiles/Mac/Build.sh" MetaHumanTestEditor Mac Development \
+    -Project="<...>/MHTNewUI/MetaHumanTest.uproject" -WaitMutex
+```
+
+| Build | What changed since the last one | Result | Time |
+|---|---|---|---|
+| 1 | everything: assistant component, camera glides, chat status line, hold-to-talk, picker functions | Succeeded | 30 s |
+| 2 | which side to look at a part from (limb lines instead of sample offsets); `/do` | Succeeded | 17 s |
+| 3 | `SimulateBotHold` / `Assistant.HoldLogo` | Succeeded | 16 s |
+| 4 | console address guard; pose-data header | Succeeded | 16 s |
+
+No errors, and no warnings in the changed files, in any of the four.
+
+## How the running editor was driven
+
+The editor's MCP server answers on `127.0.0.1:8002`. It was called over HTTP with the scripts in
+[`Tools/`](../Tools): `t.sh pie` (start Play), `t.sh con "<console command>"` (types into the editor's console
+box), `t.sh type <ref> "<text>"` (types into the chat box), `t.sh shot <name>` (screenshot of the window),
+`t.sh alog <pattern>` (the assistant's log lines). `rebuild.sh` stops Play, closes the editor, builds and
+starts it again.
+
+## Test 1 - start-up
+
+Log at Begin Play:
+
+```
+Assistant ready. Server: http://127.0.0.1:8010 (no key). Session 6900...
+Catalog fb03245fda39: 214 names (386 muscle / bone entries) from 2 picker(s) on BP_MH_CH_Abby8_C_0
+Warning: AI server not reachable at http://127.0.0.1:8010 (HTTP 0)
+```
+
+214 names is 93 muscles and ligaments plus 121 bones, the same as the atlases
+`DA_Atlas_Muscles_Segmented` and `DA_Atlas_Skeleton_Segmented` read directly from the editor.
+
+## Test 2 - every action, without a server
+
+Each line was typed into the console as `Assistant.Do ...`; the result is the component's log line.
+
+| Command | Result |
+|---|---|
+| `set_layer layer=muscles` | ok; muscles shown, the side bar's button follows |
+| `show_part kind=muscle name=Biceps_brachii side=left` | ok; highlighted, description in the chat |
+| `timeline op=pause` / `op=play` / `op=seek value=0.5` / `op=bookmark` | ok |
+| `timeline op=faster`, then `op=faster value=5`, then `op=faster` | ok, ok, **"It is already at the fastest speed (x3)."** |
+| `timeline op=set_speed value=0.5` | ok; the bar's knob shows x0.5 |
+| `timeline op=record_stop` (nothing recording) | **"Nothing is being recorded."** |
+| `camera op=zoom_in value=2`, `value=12`, then `op=zoom_in` | ok, ok, **"The camera is already as close as it goes."** |
+| `camera op=zoom_out value=3`, `op=orbit yaw=45`, `op=reset` | ok |
+| `camera op=view value=front` / `left` / `back` | ok (picture below) |
+| `play_action name=running` | ok; the avatar runs |
+| `play_action name=flying` | **"This avatar can't do "flying". It can do: Idle, Running, Jogging, TennisForehand, SoccerWarmup."** |
+| `open_panel panel=graphs`, `panel=none` | ok |
+| `show_part kind=bone name=femur` | ok; skeleton layer, femur highlighted |
+| `clear_selection`, `set_layer layer=body` | ok |
+| `bogus_action` | **"This version of the app does not know the action "bogus_action"."** |
+| `pose_estimation enabled=true`, `read_pose_data` | ok; the panel opens, the angles are written into the chat |
+| `pose_estimation enabled=false` | ok; the panel closes |
+| `switch_avatar direction=next`, `direction=previous` | ok; Beau, then Abby again; the chat keeps its messages |
+
+![Front, left, back](images/camera_views_front_left_back.png)
+
+The yellow muscle is the selected left biceps: on the avatar's left arm in the front view, on the near arm in
+the left view.
+
+## Test 3 - which side to look from
+
+First version: the camera went to the wrong side for the left biceps (below: the camera is on the avatar's
+right; the cyan muscle is only the mouse hovering).
+
+![First try](images/first_try_wrong_side.png)
+
+Cause: the direction was computed from the picking samples' offsets from "their" bone, and the muscle mesh is
+skinned to helper bones that sit on the muscles. Second version (`PickViewSide`, see [02-code.md](02-code.md)):
+
+![Six muscles](images/show_part_six_muscles.png)
+
+Left biceps from the front; right hamstring from behind; left Gluteus maximus from behind; right Pectoralis
+major from the front right; left Adductor longus from the front (not from between the legs); left upper
+Trapezius from behind.
+
+## Test 4 - hold the logo
+
+macOS did not allow the test tools to press the real mouse ("trusted for accessibility: false"), so the press
+was sent through Slate itself (`Assistant.HoldLogo`, which calls `SimulateBotHold`: mouse-down on the button,
+a timer, mouse-up). The button receives the same events as from a finger.
+
+| Command | Result |
+|---|---|
+| `Assistant.HoldLogo 3` | after 0.3 s the logo is red and the chat shows "Listening..."; on release the log says `Microphone: 2.79 s recorded, 268332 bytes`; the chat stays open (the release was not taken as a click) |
+| `Assistant.HoldLogo 0.1` | a click: the chat closes |
+| `Assistant.Talk 1` ... `Assistant.Talk 0` | the same recording path without the button: `3.71 s recorded, 356396 bytes` |
+
+| Held | Released (no server running) |
+|---|---|
+| ![Held](images/voice_listening_red.png) | ![Released](images/voice_after_release.png) |
+
+The microphone opened without a prompt on this Mac (the editor already had permission). The loudest sample was
+0.004 - 0.010: room noise, nobody was speaking.
+
+## Test 5 - through the server, on one machine
+
+A copy of the server (the rule parser; no Whisper and no Ollama on this Mac) ran on `127.0.0.1:8011`.
+Requests were made with `Assistant.Ask <text>` and by typing into the chat box. From the log:
+
+```
+The AI server answers. Language model gemma4:e4b: not ready (direct commands still work). Speech recognition base.en: not ready (typing still works).
+<- [rules 12 ms] heard "switch to the muscle layer" | 1 action(s), 0 failed | "Showing the muscle layer."
+<- [rules 1 ms] heard "show me the left biceps" | 1 action(s), 0 failed | "Here is the left Biceps brachii."
+<- [rules 0 ms] heard "pause" | 1 action(s), 0 failed | "Paused."
+<- [rules 0 ms] heard "play it faster" | 2 action(s), 0 failed | "Playing faster."
+<- [rules 0 ms] heard "zoom in a lot" | 1 action(s), 0 failed | "Zooming in a lot."
+<- [rules 0 ms] heard "show me the hamstring" | 1 action(s), 0 failed | "For the hamstring I am showing the Biceps femoris (long head)."
+<- [rules 0 ms] heard "highlight the femur" | 1 action(s), 0 failed | "Here is the Femur."
+<- [error 24 ms] heard "what does the deltoid do" | 0 action(s), 0 failed | "The language model is not answering right now, but the direct commands still work. ..."
+<- [rules 0 ms] heard "reset the view and show the body" | 2 action(s), 0 failed | "Camera reset. Showing the body layer."
+<- [rules 0 ms] heard "activate realtime pose estimation and read the data" | 2 action(s), 0 failed | "Starting the pose estimation and reading the joint angles."
+<- [rules 1 ms] heard "what is the right knee angle" | 0 action(s), 0 failed | "The right knee is at 52 degrees."
+<- [rules 0 ms] heard "stop pose estimation" | 1 action(s), 0 failed | "Stopping the pose estimation."
+<- [rules 0 ms] heard "make her run" | 1 action(s), 0 failed | "Playing the Running action."
+<- [rules 19 ms] heard "show me the flux capacitor" | 0 action(s), 0 failed | "I do not know a part called "flux capacitor". The closest names I have are Flexor carpi ulnaris and Flexor carpi radialis."
+```
+
+The times are the server's own; the app adds the HTTP round trip on the same machine.
+
+![Left biceps and hamstring through the server](images/e2e_biceps_hamstring.png)
+
+![Pose estimation started and read; running; an unknown part](images/e2e_pose_and_running.png)
+
+Typed into the chat box itself: `/status`, `/help`, "show me the muscles", "where is the right quadriceps",
+`/do camera op=view value=back`, "now the skeleton", "show the left shoulder blade", "go to the middle and
+pause", `/server`. All answered as expected:
+
+![Help, quadriceps, shoulder blade](images/chat_help_quads_scapula.png)
+
+## Test 6 - keys, errors, voice upload
+
+| Case | Result |
+|---|---|
+| server started with `ASSISTANT_API_KEY`, app has no key | HTTP 401; chat: "The AI server did not accept my key. Set it with /key <text>." |
+| the same, after `Assistant.Key <the key>` | answered normally |
+| no server running | chat: "I can't reach the AI server at http://127.0.0.1:8010. Check the network, or set the address with /server <address>." |
+| a recording uploaded to the server without speech recognition | the multipart request is accepted and parsed; HTTP 503 "Speech recognition is not installed on this server"; the chat shows that sentence |
+
+## A trap found on the way
+
+`Assistant.Server http://127.0.0.1:8011` in the **console** set the address to `http:`: the Unreal console
+reads `//` as the start of a comment. The console command now refuses `http:` and says to give `host:port`
+(the scheme is added). `/server http://...` in the chat box never had the problem.
+
+## Not tested
+
+- **Whisper and the language model**: neither is on this Mac. First job on the Spark.
+- **Any network but `127.0.0.1`.**
+- **A real finger / mouse on the logo, a real click on a muscle** (see Test 4; a click fires the same
+  `OnSelectionChanged` that Test 2's `show_part` fires).
+- **iPad, Windows, a packaged build.** On a packaged Mac / iOS app plain `http://` may be refused by the
+  system (the editor's own Info.plist allows it); `https://` through `tailscale serve` avoids the question.
+  iOS also needs `NSMicrophoneUsageDescription`.
+- **Long sessions**: the chat keeps every bubble; nothing trims it.
