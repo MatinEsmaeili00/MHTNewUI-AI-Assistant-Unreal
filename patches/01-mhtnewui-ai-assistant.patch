@@ -14,7 +14,7 @@ index 1cd8ee7..57167d2 100644
  	]
  }
 diff --git a/Plugins/MetaHumanAnatomyLayers/Source/MetaHumanAnatomyLayers/Private/AnatomyPickerComp.cpp b/Plugins/MetaHumanAnatomyLayers/Source/MetaHumanAnatomyLayers/Private/AnatomyPickerComp.cpp
-index e717929..ec0ee3a 100644
+index e717929..92924e1 100644
 --- a/Plugins/MetaHumanAnatomyLayers/Source/MetaHumanAnatomyLayers/Private/AnatomyPickerComp.cpp
 +++ b/Plugins/MetaHumanAnatomyLayers/Source/MetaHumanAnatomyLayers/Private/AnatomyPickerComp.cpp
 @@ -167,6 +167,13 @@ void UAnatomyPickerComp::UpdateHover(FVector RayOrigin, FVector RayDirection)
@@ -31,7 +31,24 @@ index e717929..ec0ee3a 100644
  }
  
  void UAnatomyPickerComp::ClearHover()
-@@ -201,6 +208,74 @@ bool UAnatomyPickerComp::SelectHovered()
+@@ -174,6 +181,16 @@ void UAnatomyPickerComp::ClearHover()
+ 	SetHovered(0);
+ }
+ 
++void UAnatomyPickerComp::UpdateWithoutPointer()
++{
++	ClearHover();
++	// The selection may have to appear (its layer has just arrived) or disappear (another layer is shown now).
++	if (HighlightMesh && HighlightMesh->IsVisible() != (SelectedId > 0 && IsPickingActive()))
++	{
++		RefreshHighlight();
++	}
++}
++
+ void UAnatomyPickerComp::SetHovered(int32 MuscleId)
+ {
+ 	if (MuscleId == HoveredId)
+@@ -201,6 +218,74 @@ bool UAnatomyPickerComp::SelectHovered()
  	return true;
  }
  
@@ -107,10 +124,24 @@ index e717929..ec0ee3a 100644
  {
  	if (SelectedId != 0)
 diff --git a/Plugins/MetaHumanAnatomyLayers/Source/MetaHumanAnatomyLayers/Public/AnatomyPickerComp.h b/Plugins/MetaHumanAnatomyLayers/Source/MetaHumanAnatomyLayers/Public/AnatomyPickerComp.h
-index bf6e0be..5df2d2d 100644
+index bf6e0be..02fe2fe 100644
 --- a/Plugins/MetaHumanAnatomyLayers/Source/MetaHumanAnatomyLayers/Public/AnatomyPickerComp.h
 +++ b/Plugins/MetaHumanAnatomyLayers/Source/MetaHumanAnatomyLayers/Public/AnatomyPickerComp.h
-@@ -70,6 +70,21 @@ public:
+@@ -63,6 +63,13 @@ public:
+ 	UFUNCTION(BlueprintCallable, Category="Anatomy Picker")
+ 	void ClearHover();
+ 
++	/** Call instead of UpdateHover on a frame with no pointer over the view (the mouse is outside the window, a
++	 *  touch screen with no finger down): nothing is hovered, and the selection's glow is shown / hidden for the
++	 *  layer that is on now. Without it a glow stayed on screen when the layer was changed by something other than
++	 *  the mouse (the assistant's "show the body") while the pointer was away. */
++	UFUNCTION(BlueprintCallable, Category="Anatomy Picker")
++	void UpdateWithoutPointer();
++
+ 	/** Select the hovered muscle (or clear the selection if nothing is hovered). Returns true if a muscle is selected. */
+ 	UFUNCTION(BlueprintCallable, Category="Anatomy Picker")
+ 	bool SelectHovered();
+@@ -70,6 +77,21 @@ public:
  	UFUNCTION(BlueprintCallable, Category="Anatomy Picker")
  	void ClearSelection();
  
@@ -397,7 +428,7 @@ index 425098e..f40846f 100644
 +	FTimerHandle ViewMoveTimer;
  };
 diff --git a/Source/MetaHumanTest/CPP_PlayerController.cpp b/Source/MetaHumanTest/CPP_PlayerController.cpp
-index a10ef06..45a004f 100644
+index a10ef06..603a0ab 100644
 --- a/Source/MetaHumanTest/CPP_PlayerController.cpp
 +++ b/Source/MetaHumanTest/CPP_PlayerController.cpp
 @@ -14,6 +14,7 @@
@@ -417,6 +448,23 @@ index a10ef06..45a004f 100644
  }
  
  void ACPP_PlayerController::BeginPlay()
+@@ -316,6 +319,16 @@ void ACPP_PlayerController::UpdateMusclePicking()
+ 			Picker->UpdateHover(RayOrigin, RayDirection); // an inactive picker clears its own hover
+ 		}
+ 	}
++	else if (float MouseX, MouseY; !GetMousePosition(MouseX, MouseY))
++	{
++		// No pointer over the view at all (not the same as orbiting with the right button, which keeps the hover):
++		// nothing is hovered, and each picker shows / hides its selection's glow for the layer that is on now.
++		// The assistant changes layers by voice, with the pointer anywhere.
++		for (UAnatomyPickerComp* Picker : Pickers)
++		{
++			Picker->UpdateWithoutPointer();
++		}
++	}
+ 
+ 	// Click (press + release without dragging, since a left drag pans the camera) selects.
+ 	FVector2D Mouse;
 diff --git a/Source/MetaHumanTest/CPP_PlayerController.h b/Source/MetaHumanTest/CPP_PlayerController.h
 index f47a384..0b6fa90 100644
 --- a/Source/MetaHumanTest/CPP_PlayerController.h
@@ -477,10 +525,10 @@ index 57f6e2b..4171075 100644
  		// The Sports2D models (.onnx) are read at runtime: ship them with packaged builds.
 diff --git a/Source/MetaHumanTest/Private/Assistant/IHPCAssistantActions.cpp b/Source/MetaHumanTest/Private/Assistant/IHPCAssistantActions.cpp
 new file mode 100644
-index 0000000..944dcc7
+index 0000000..1160f58
 --- /dev/null
 +++ b/Source/MetaHumanTest/Private/Assistant/IHPCAssistantActions.cpp
-@@ -0,0 +1,1005 @@
+@@ -0,0 +1,1006 @@
 +// IHPCAssistantActions.cpp - what the assistant can DO: one function per action type of docs/PROTOCOL.md.
 +// Every function returns whether it worked and, if not, one sentence for the user. Nothing here talks to the
 +// server; "Assistant.Do <type> key=value ..." in the console runs the same code.
@@ -752,7 +800,8 @@ index 0000000..944dcc7
 +		{
 +			Where /= 100.0;   // "50" was meant as a percentage
 +		}
-+		UIHPCUILibrary::SeekAvatarTimeline(this, static_cast<float>(FMath::Clamp(Where, 0.0, 1.0)), /*bPauseAfterSeek*/ false);
++		// Not quite 1: a looping animation wraps, so exactly 1 is the start again and "go to the end" would rewind.
++		UIHPCUILibrary::SeekAvatarTimeline(this, static_cast<float>(FMath::Clamp(Where, 0.0, 0.999)), /*bPauseAfterSeek*/ false);
 +		return Ok(Type);
 +	}
 +	if (Op == TEXT("step"))

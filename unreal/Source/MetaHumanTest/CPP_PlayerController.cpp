@@ -319,6 +319,16 @@ void ACPP_PlayerController::UpdateMusclePicking()
 			Picker->UpdateHover(RayOrigin, RayDirection); // an inactive picker clears its own hover
 		}
 	}
+	else if (float MouseX, MouseY; !GetMousePosition(MouseX, MouseY))
+	{
+		// No pointer over the view at all (not the same as orbiting with the right button, which keeps the hover):
+		// nothing is hovered, and each picker shows / hides its selection's glow for the layer that is on now.
+		// The assistant changes layers by voice, with the pointer anywhere.
+		for (UAnatomyPickerComp* Picker : Pickers)
+		{
+			Picker->UpdateWithoutPointer();
+		}
+	}
 
 	// Click (press + release without dragging, since a left drag pans the camera) selects.
 	FVector2D Mouse;

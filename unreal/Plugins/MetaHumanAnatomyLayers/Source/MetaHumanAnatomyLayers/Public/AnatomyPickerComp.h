@@ -63,6 +63,13 @@ public:
 	UFUNCTION(BlueprintCallable, Category="Anatomy Picker")
 	void ClearHover();
 
+	/** Call instead of UpdateHover on a frame with no pointer over the view (the mouse is outside the window, a
+	 *  touch screen with no finger down): nothing is hovered, and the selection's glow is shown / hidden for the
+	 *  layer that is on now. Without it a glow stayed on screen when the layer was changed by something other than
+	 *  the mouse (the assistant's "show the body") while the pointer was away. */
+	UFUNCTION(BlueprintCallable, Category="Anatomy Picker")
+	void UpdateWithoutPointer();
+
 	/** Select the hovered muscle (or clear the selection if nothing is hovered). Returns true if a muscle is selected. */
 	UFUNCTION(BlueprintCallable, Category="Anatomy Picker")
 	bool SelectHovered();

@@ -269,7 +269,8 @@ FIHPCActionResult UIHPCAssistantComp::DoTimeline(const FJsonObject& Action)
 		{
 			Where /= 100.0;   // "50" was meant as a percentage
 		}
-		UIHPCUILibrary::SeekAvatarTimeline(this, static_cast<float>(FMath::Clamp(Where, 0.0, 1.0)), /*bPauseAfterSeek*/ false);
+		// Not quite 1: a looping animation wraps, so exactly 1 is the start again and "go to the end" would rewind.
+		UIHPCUILibrary::SeekAvatarTimeline(this, static_cast<float>(FMath::Clamp(Where, 0.0, 0.999)), /*bPauseAfterSeek*/ false);
 		return Ok(Type);
 	}
 	if (Op == TEXT("step"))

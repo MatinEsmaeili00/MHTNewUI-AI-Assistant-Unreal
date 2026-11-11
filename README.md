@@ -44,21 +44,24 @@ Unreal (Mac / iPad, anywhere)                      DGX Spark (Louisiana)
 
 ## Status (2026-11-11)
 
-Built with Unreal 5.8 on a Mac (four builds, all "Succeeded", no warnings in the changed files) and tested in
+Built with Unreal 5.8 on a Mac (five builds, all "Succeeded", no warnings in the changed files) and tested in
 Play-In-Editor. Details and pictures: [docs/03-build-and-test.md](docs/03-build-and-test.md).
 
 | Tested | Result |
 |---|---|
 | every action type, run without the server | works; limits and unknown names give a sentence instead of doing nothing |
-| typed requests through a local copy of the server (21 requests) | works; server time 0 - 24 ms each |
+| typed requests through the server running on the same Mac (29 requests) | works; server time 0 - 24 ms each |
+| spoken requests: 3 clips of synthetic speech, uploaded by the app, transcribed by Whisper on that server | heard correctly, actions run; about 0.3 s each |
 | hold the logo (pointer events sent through Slate) | red while held, 2.8 s recorded, release does not toggle the chat, a short press still does |
 | voice upload | reaches the server as a valid multipart request |
 | wrong key, right key, server not running | each gives its own sentence in the chat |
 
 Not tested yet, and why:
 
-- **Speech recognition and the language model.** The Mac has neither Whisper's server-side setup nor Ollama.
-  That is the first job on the Spark (see the server repository's `docs/HANDOFF.md`).
+- **The language model.** The Mac has no Ollama, so questions ("what does the deltoid do?") got the server's
+  "the language model is not answering" reply. First job on the Spark (the server repository's `docs/HANDOFF.md`).
+- **Real voices.** Speech was synthetic (macOS `say`) sent as a file; the microphone path was tested
+  separately and recorded room noise, because nobody could speak into it during the tests.
 - **The link between two cities.** Only `127.0.0.1` so far. See [docs/NETWORK.md](docs/NETWORK.md).
 - **A real finger or mouse holding the logo, and a real click on a muscle.** macOS did not let the test tools
   move the mouse. The hold was tested with pointer events sent through Unreal's own UI layer (the same path a

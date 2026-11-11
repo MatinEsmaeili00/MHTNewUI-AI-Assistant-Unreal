@@ -22,14 +22,14 @@ The files are in [`unreal/`](../unreal) with the project's own paths, and as one
 
 | File | Change |
 |---|---|
-| `CPP_PlayerController.h/.cpp` | creates the `Assistant` component next to `PoseEstimation`; `GetAssistant()`, `GetCurrentPawnIndex()` |
+| `CPP_PlayerController.h/.cpp` | creates the `Assistant` component next to `PoseEstimation`; `GetAssistant()`, `GetCurrentPawnIndex()`; on a frame with no pointer over the view the pickers get `UpdateWithoutPointer` |
 | `IHPC_UI/CPP_UW_IHPCSideBar.h/.cpp` | hold the BOT logo = push-to-talk: hold timer, the red look, `OnBotVoiceHoldStarted` / `OnBotVoiceHoldEnded`, `SetBotVoiceActive`, `SetBotInputLevel`, `SimulateBotHold` (test) |
 | `IHPC_UI/CPP_UW_IHPCChatPanel.h/.cpp` | `SetStatus` / `ClearStatus`: the temporary "Listening..." / "Thinking..." line |
 | `CPP_UW_MuscleInfo.h/.cpp` | `bShowPopupOnSelect` (off): a click no longer opens the info popup; the hover tooltip stays |
 | `CPP_MouseFunctionComp.h/.cpp` | scripted camera moves that glide: `MoveViewTo`, `GlideToDistance`, `GlideOrbitBy`, `GlideToStartView` |
 | `IHPC_UI/CPP_UW_IHPCActionsPanel.h/.cpp` | `GetAvailableActions()`, `GetHighlightedAction()` |
 | `IHPC_UI/CPP_UW_IHPCHud.h` | `GetActionsPanel()` |
-| `Plugins/MetaHumanAnatomyLayers/.../AnatomyPickerComp.h/.cpp` | `SelectById`, `GetAtlas`, `GetMuscleWorldLocation`; the glow of a selection made during a layer change now appears when the layer arrives |
+| `Plugins/MetaHumanAnatomyLayers/.../AnatomyPickerComp.h/.cpp` | `SelectById`, `GetAtlas`, `GetMuscleWorldLocation`, `UpdateWithoutPointer`; the glow of a selection made during a layer change now appears when the layer arrives |
 | `MetaHumanTest.Build.cs` | modules `HTTP`, `Json`, `AudioCaptureCore`, `AudioCapture` |
 | `MetaHumanTest.uproject` | plugin `AudioCapture` listed (it is on by default; listed because the module depends on it) |
 
@@ -119,6 +119,10 @@ Details that are not obvious:
   (`GetAvatarFrame`), because the avatars are plain pawns whose actor rotation says nothing about where they face.
   A first attempt used the picking samples' offsets from the bone they are attached to; that failed because the
   muscle mesh is skinned to MetaHuman helper bones that sit on the muscles themselves.
+- **`seek` stops at 0.999.** The animation loops, so exactly 1 is the start again; "go to the end" would rewind.
+- **The glow follows the layer without the mouse.** A picker only re-checked whether its glow should show when
+  the mouse ray was updated. With the pointer outside the view (talking, a touch screen), "show the body" left
+  the selected muscle glowing over the skin. The controller now calls `UpdateWithoutPointer` on such frames.
 - **`play_action` on the card that is already on does nothing.** Selecting it again would switch it off (a
   second click on a card means "back to Idle").
 - **Descriptions come from the selection event.** `SelectById` fires the picker's `OnSelectionChanged`, the same

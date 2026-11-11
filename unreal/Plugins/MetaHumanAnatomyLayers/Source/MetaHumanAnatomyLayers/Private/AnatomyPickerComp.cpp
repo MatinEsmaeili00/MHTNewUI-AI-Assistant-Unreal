@@ -181,6 +181,16 @@ void UAnatomyPickerComp::ClearHover()
 	SetHovered(0);
 }
 
+void UAnatomyPickerComp::UpdateWithoutPointer()
+{
+	ClearHover();
+	// The selection may have to appear (its layer has just arrived) or disappear (another layer is shown now).
+	if (HighlightMesh && HighlightMesh->IsVisible() != (SelectedId > 0 && IsPickingActive()))
+	{
+		RefreshHighlight();
+	}
+}
+
 void UAnatomyPickerComp::SetHovered(int32 MuscleId)
 {
 	if (MuscleId == HoveredId)

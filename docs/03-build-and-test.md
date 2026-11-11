@@ -18,8 +18,9 @@ With the editor closed:
 | 2 | which side to look at a part from (limb lines instead of sample offsets); `/do` | Succeeded | 17 s |
 | 3 | `SimulateBotHold` / `Assistant.HoldLogo` | Succeeded | 16 s |
 | 4 | console address guard; pose-data header | Succeeded | 16 s |
+| 5 | the glow follows the layer with no pointer over the view; `seek` stops at 0.999 | Succeeded | 11 s |
 
-No errors, and no warnings in the changed files, in any of the four.
+No errors, and no warnings in the changed files, in any of the five.
 
 ## How the running editor was driven
 
@@ -109,7 +110,7 @@ The microphone opened without a prompt on this Mac (the editor already had permi
 
 ## Test 5 - through the server, on one machine
 
-A copy of the server (the rule parser; no Whisper and no Ollama on this Mac) ran on `127.0.0.1:8011`.
+The server ran on the same Mac, on `127.0.0.1:8011` (no Ollama on this Mac; speech recognition was added for Test 7).
 Requests were made with `Assistant.Ask <text>` and by typing into the chat box. From the log:
 
 ```
@@ -151,6 +152,44 @@ pause", `/server`. All answered as expected:
 | no server running | chat: "I can't reach the AI server at http://127.0.0.1:8010. Check the network, or set the address with /server <address>." |
 | a recording uploaded to the server without speech recognition | the multipart request is accepted and parsed; HTTP 503 "Speech recognition is not installed on this server"; the chat shows that sentence |
 
+## Test 7 - spoken requests through the whole chain
+
+The server was restarted with faster-whisper (`base.en`, CPU). Three clips were made with macOS `say`
+(16-bit mono, 48 kHz: the format the app records) and sent by the app itself with `Assistant.SendWav <file>`,
+which uploads them exactly as a microphone recording is uploaded.
+
+```
+-> http://127.0.0.1:8011/v1/voice (162184 bytes of audio)
+<- the server asked for the catalog; repeating "Show me the right hamstring." with it
+<- [rules 7 ms] heard "Show me the right hamstring." | 1 action(s), 0 failed | "For the hamstring I am showing the right Biceps femoris (long head)."
+-> http://127.0.0.1:8011/v1/voice (198302 bytes of audio)
+<- [rules 286 ms] heard "Switch to the skeleton and zoom out." | 2 action(s), 0 failed | "Showing the skeleton layer. Zooming out."
+-> http://127.0.0.1:8011/v1/voice (302474 bytes of audio)
+<- [rules 301 ms] heard "Activate real-time pose estimation and read the data." | 2 action(s), 0 failed | "Starting the pose estimation and reading the joint angles."
+```
+
+The first clip also exercised the `need_catalog` repeat over real HTTP: the freshly started server did not
+know the avatar's names, asked, and got the same words again as text with the catalog (the clip was not
+uploaded twice). The two later times include Whisper.
+
+![Hamstring by voice; pose estimation by voice; "rotate left" before and after](images/voice_e2e_and_rotate_left.png)
+
+"Rotate left" from the front view: the camera moves to its left (we see more of the avatar's right side),
+as the protocol says.
+
+![Rotate left](images/rotate_left_before_after.png)
+
+## Test 8 - two fixes from the tests above
+
+- **"Go to the end" went to the start**: the animation loops, so position 1 wraps to 0. `seek` now stops at
+  0.999. Checked: the timeline knob is at the right end (last picture below).
+- **A highlight stayed on screen in the body layer** when the layer was changed by the assistant while the
+  mouse was outside the game view (the pickers only re-checked their glow on a mouse update). With the fix:
+  the biceps is highlighted, "show the body" hides the glow, "show the muscles" brings it back, with the mouse
+  parked outside the view the whole time.
+
+![Biceps selected; body: no glow; muscles: the glow is back; paused at the end](images/fix_highlight_follows_layer.png)
+
 ## A trap found on the way
 
 `Assistant.Server http://127.0.0.1:8011` in the **console** set the address to `http:`: the Unreal console
@@ -159,7 +198,8 @@ reads `//` as the start of a comment. The console command now refuses `http:` an
 
 ## Not tested
 
-- **Whisper and the language model**: neither is on this Mac. First job on the Spark.
+- **The language model**: no Ollama on this Mac. First job on the Spark.
+- **Real voices**: speech was synthetic and sent as files; the microphone recorded only room noise.
 - **Any network but `127.0.0.1`.**
 - **A real finger / mouse on the logo, a real click on a muscle** (see Test 4; a click fires the same
   `OnSelectionChanged` that Test 2's `show_part` fires).
