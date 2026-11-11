@@ -55,14 +55,14 @@ Play-In-Editor. Details and pictures: [docs/03-build-and-test.md](docs/03-build-
 | hold the logo (pointer events sent through Slate) | red while held, 2.8 s recorded, release does not toggle the chat, a short press still does |
 | voice upload | reaches the server as a valid multipart request |
 | wrong key, right key, server not running | each gives its own sentence in the chat |
+| **the server on the DGX Spark, over Tailscale** (25 requests: typed, spoken, language-model questions) | all answered, all actions run; about 20 ms for direct commands, 0.5 - 0.7 s spoken, 2 - 3 s when the language model answers |
 
 Not tested yet, and why:
 
-- **The language model.** The Mac has no Ollama, so questions ("what does the deltoid do?") got the server's
-  "the language model is not answering" reply. First job on the Spark (the server repository's `docs/HANDOFF.md`).
 - **Real voices.** Speech was synthetic (macOS `say`) sent as a file; the microphone path was tested
   separately and recorded room noise, because nobody could speak into it during the tests.
-- **The link between two cities.** Only `127.0.0.1` so far. See [docs/NETWORK.md](docs/NETWORK.md).
+- **The link between two cities.** The Spark was reached over Tailscale with both machines in the same city
+  (4 ms). See [docs/NETWORK.md](docs/NETWORK.md).
 - **A real finger or mouse holding the logo, and a real click on a muscle.** macOS did not let the test tools
   move the mouse. The hold was tested with pointer events sent through Unreal's own UI layer (the same path a
   finger takes); a muscle click ends in the same event that "show me ..." fires, which was tested.

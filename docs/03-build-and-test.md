@@ -190,6 +190,41 @@ as the protocol says.
 
 ![Biceps selected; body: no glow; muscles: the glow is back; paused at the end](images/fix_highlight_follows_layer.png)
 
+## Test 9 - against the DGX Spark, over Tailscale
+
+Later the same day the server ran on the Spark as a service (language model `gemma4:12b`, Whisper `base.en`,
+key required) and this Mac joined the same Tailscale network. The Spark is `spark-99eb` there.
+
+```
+curl http://spark-99eb:8010/health   ->  {"status":"ok", ... "auth_required":true,"llm_model":"gemma4:12b","llm_ready":true,"stt_model":"base.en","stt_ready":true}
+tailscale ping spark-99eb            ->  pong ... in 4ms (direct path)
+```
+
+Both machines were in the same city for this test; the link between two cities is still to be measured.
+
+In the app: `Assistant.Server spark-99eb:8010`, then `/key <text>` typed once by the user (both are remembered
+in `GameUserSettings.ini`). Without the key the chat said "The AI server did not accept my key."
+
+25 requests from the app, all answered and all actions run. Round trip = from the app sending to the answer
+arriving, read from the log's time stamps.
+
+| Request | How | Answered by | Round trip |
+|---|---|---|---|
+| 15 direct commands (layers, biceps, hamstring, femur, timeline, camera, run, pose estimation on + read, knee angle, off) | typed | rules | about 20 ms |
+| "what does the deltoid do" | typed | language model | 1.9 s |
+| "hello, what can you do" | typed | language model | 2.4 s |
+| "which muscles work the hardest when running" | typed | language model | 2.3 s |
+| "can you make the avatar bigger" | typed | language model: "I cannot change the size of the avatar, but I can zoom the camera in", and it zoomed in | 2.2 s |
+| "show me the muscles and then tell me what the soleus is for" | typed | language model: switched the layer and answered | 2.3 s |
+| "show me the right hamstring" | spoken (synthetic clip) | Whisper + rules | 0.46 s |
+| "show me the left quadriceps and zoom in" | spoken | Whisper + rules, two actions | 0.63 s |
+| "what does the gluteus maximus do when I run" | spoken | Whisper + language model | 3.0 s |
+| "activate real time pose estimation and read the data" | spoken | Whisper + rules | 0.69 s |
+
+The language-model answers were two sentences each, as asked for, with no markdown.
+
+![Language-model answers and spoken requests through the Spark](images/spark_llm_and_voice.png)
+
 ## A trap found on the way
 
 `Assistant.Server http://127.0.0.1:8011` in the **console** set the address to `http:`: the Unreal console
